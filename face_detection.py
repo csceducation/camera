@@ -14,10 +14,17 @@ import tempfile
 import shutil
 import os
 import mimetypes
+import json
+from datetime import datetime, timedelta
 
 # This can be a local directory name (e.g. "known_faces")
 # or a URL such as the provided VDM endpoint.
 KNOWN_FACES_SOURCE = "known_faces"
+
+# Cache directory for downloaded remote faces
+CACHE_DIR = "cached_faces"
+# How often to refresh cache (in hours) - 12 hours = twice daily
+CACHE_REFRESH_HOURS = 12
 
 def check_image(image_path):
     """Check if an image contains a detectable face."""
@@ -77,29 +84,71 @@ def main():
     print("FACE IMAGE DIAGNOSTIC TOOL")
     print("=" * 70)
     
-    # If the source is a URL, process images directly from the remote URLs
-    # in-memory (no disk downloads). If it's a local path, keep current behavior.
+    # If the source is a URL, ALWAYS sync on every script start (no cache validation)
+    # then process cached files. If it's a local path, keep current behavior.
     if str(KNOWN_FACES_SOURCE).lower().startswith(('http://', 'https://')):
-        print(f"🔗 Detected remote known-faces source: {KNOWN_FACES_SOURCE}")
+        print(f"🔗 Remote known-faces source: {KNOWN_FACES_SOURCE}")
+        print(f"  � Syncing images from remote source...")
+        
+        cache_path = Path(CACHE_DIR)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        remote_dir = cache_path / "remote_students"
+        
+        # Clear old cache
+        if remote_dir.exists():
+            shutil.rmtree(remote_dir)
+        remote_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get and download images
         try:
             image_urls = get_image_urls_from_url(KNOWN_FACES_SOURCE)
+            if not image_urls:
+                print(f"❌ No images found at remote source")
+                return
+            
+            print(f"  ↳ Found {len(image_urls)} image(s) to download")
+            
+            downloaded = 0
+            for url in image_urls:
+                try:
+                    filename = os.path.basename(urllib.parse.urlsplit(url).path)
+                    if not filename or not _is_image_url(filename):
+                        filename = f'student_{downloaded}.jpg'
+                    
+                    target_path = remote_dir / filename
+                    
+                    req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        with open(target_path, 'wb') as f:
+                            shutil.copyfileobj(resp, f)
+                    
+                    downloaded += 1
+                    print(f"  ↓ Downloaded: {filename}")
+                except Exception as e:
+                    print(f"  ⚠️  Failed to download {url}: {e}")
+            
+            if downloaded == 0:
+                print(f"❌ No images were successfully downloaded")
+                return
+            
+            # Update metadata
+            metadata = {
+                'last_sync': datetime.now().isoformat(),
+                'source_url': KNOWN_FACES_SOURCE,
+                'images_downloaded': downloaded
+            }
+            metadata_file = cache_path / ".cache_metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"  ✅ Successfully synced {downloaded} image(s)")
+            
         except Exception as e:
-            print(f"❌ Failed to retrieve image URLs: {e}")
+            print(f"❌ Failed to sync remote images: {e}")
             return
-
-        if not image_urls:
-            print(f"❌ No images found at remote source: {KNOWN_FACES_SOURCE}")
-            return
-
-        total_images = 0
-        valid_images = 0
-        print(f"  ↳ Found {len(image_urls)} remote image(s)")
-
-        for url in sorted(image_urls):
-            total_images += 1
-            if check_image_url(url):
-                valid_images += 1
-
+        
+        # Now process the cached directory
+        known_faces_path = cache_path
     else:
         known_faces_path = Path(KNOWN_FACES_SOURCE)
 
@@ -161,6 +210,111 @@ if __name__ == "__main__":
 
 
 ### Helper functions for remote fetching ###
+
+def needs_cache_refresh(cache_dir, refresh_hours):
+    """Check if cache needs to be refreshed based on last sync time."""
+    cache_path = Path(cache_dir)
+    metadata_file = cache_path / ".cache_metadata.json"
+    
+    if not metadata_file.exists():
+        return True
+    
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        last_sync = datetime.fromisoformat(metadata.get('last_sync', ''))
+        time_since_sync = datetime.now() - last_sync
+        
+        return time_since_sync > timedelta(hours=refresh_hours)
+    except Exception:
+        return True
+
+
+def sync_remote_faces(source_url, cache_dir, refresh_hours):
+    """Download/update cached faces from remote URL if refresh is needed.
+    
+    This function:
+    - Checks if cache needs refresh (based on refresh_hours interval)
+    - Downloads images from source_url
+    - Saves them to cache_dir/remote_students/
+    - Updates metadata with last sync time
+    """
+    cache_path = Path(cache_dir)
+    
+    if not needs_cache_refresh(cache_dir, refresh_hours):
+        metadata_file = cache_path / ".cache_metadata.json"
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        last_sync = datetime.fromisoformat(metadata['last_sync'])
+        next_sync = last_sync + timedelta(hours=refresh_hours)
+        time_remaining = next_sync - datetime.now()
+        hours = int(time_remaining.total_seconds() // 3600)
+        minutes = int((time_remaining.total_seconds() % 3600) // 60)
+        
+        print(f"  ✓ Cache is fresh (last synced: {last_sync.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"  ↳ Next sync in {hours}h {minutes}m")
+        return
+    
+    print(f"  🔄 Syncing images from remote source...")
+    
+    # Create cache directory
+    cache_path.mkdir(parents=True, exist_ok=True)
+    remote_dir = cache_path / "remote_students"
+    
+    # Clear old cache
+    if remote_dir.exists():
+        shutil.rmtree(remote_dir)
+    remote_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get image URLs
+    try:
+        image_urls = get_image_urls_from_url(source_url)
+    except Exception as e:
+        raise RuntimeError(f"Failed to get image URLs: {e}")
+    
+    if not image_urls:
+        raise RuntimeError("No images found at remote source")
+    
+    print(f"  ↳ Found {len(image_urls)} image(s) to download")
+    
+    # Download images
+    downloaded = 0
+    for url in image_urls:
+        try:
+            filename = os.path.basename(urllib.parse.urlsplit(url).path)
+            if not filename or not _is_image_url(filename):
+                filename = f'student_{downloaded}.jpg'
+            
+            target_path = remote_dir / filename
+            
+            req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                with open(target_path, 'wb') as f:
+                    shutil.copyfileobj(resp, f)
+            
+            downloaded += 1
+            print(f"  ↓ Downloaded: {filename}")
+        except Exception as e:
+            print(f"  ⚠️  Failed to download {url}: {e}")
+    
+    if downloaded == 0:
+        raise RuntimeError("No images were successfully downloaded")
+    
+    # Update metadata
+    metadata = {
+        'last_sync': datetime.now().isoformat(),
+        'source_url': source_url,
+        'images_downloaded': downloaded
+    }
+    
+    metadata_file = cache_path / ".cache_metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"  ✅ Successfully synced {downloaded} image(s)")
+    print(f"  ↳ Next sync in {refresh_hours} hours")
+
 
 class _LinkParser(HTMLParser):
     def __init__(self, base_url):
