@@ -1,23 +1,23 @@
 # Core Dependencies
-opencv-python>=4.8.0
-face_recognition>=1.3.0
-numpy>=1.24.0
-imutils>=0.5.4
+opencv-python
+face_recognition
+numpy
+imutils
 
 # Deep Learning (Anti-Spoof)
-torch>=2.0.0
-torchvision>=0.15.0
+torch
+torchvision
 
 # Camera (Raspberry Pi)
-picamera2>=0.3.12
+picamera2
 
 # Face Mesh / Liveness Detection
-mediapipe>=0.10.0
+mediapipe
 
 # FastAPI Server
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-requests>=2.31.0
+fastapi
+uvicorn[standard]
+requests
 
 # Utilities
-Pillow>=10.0.0
+Pillow
