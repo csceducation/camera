@@ -34,6 +34,10 @@ LIVENESS_WINDOW = 12
 MIN_CONFIDENCE = 0.5
 IN_OUT_GAP_HOURS = 1
 MODEL_PATH = "2.7_80x80_MiniFASNetV2.pth"
+
+# Anti-spoof configuration
+ANTI_SPOOF_THRESHOLD = 0.3  # Lower = more strict, Higher = more lenient (0.3-0.5 recommended)
+ENABLE_ANTI_SPOOF = True    # Set to False to disable anti-spoof checking
 # ----------------------------
 
 # ---------- MiniFASNet V2 (official lightweight version) ----------
@@ -88,19 +92,35 @@ anti_spoof_model.load_state_dict(torch.load(MODEL_PATH, map_location=device), st
 anti_spoof_model.eval()
 
 def is_spoof_or_phone(frame_bgr, bbox):
+    """Check if face is a spoof (photo/video) or real person.
+    
+    Returns:
+        tuple: (is_spoof: bool, real_score: float)
+    """
+    if not ENABLE_ANTI_SPOOF:
+        return False, 1.0  # Anti-spoof disabled, always consider real
+    
     (l,t,r,b) = bbox
     h,w = frame_bgr.shape[:2]
     x1,y1 = max(l-20,0), max(t-20,0)
     x2,y2 = min(r+20,w), min(b+20,h)
     roi = frame_bgr[y1:y2, x1:x2]
-    if roi.size == 0: return False
-    roi = cv2.resize(roi,(80,80))
-    roi = cv2.cvtColor(roi,cv2.COLOR_BGR2RGB).transpose(2,0,1)/255.0
-    roi = torch.tensor(roi,dtype=torch.float32).unsqueeze(0)
+    
+    if roi.size == 0:
+        return False, 0.0  # Can't determine, assume real
+    
+    # Preprocess for model
+    roi = cv2.resize(roi, (80, 80))
+    roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB).transpose(2, 0, 1) / 255.0
+    roi = torch.tensor(roi, dtype=torch.float32).unsqueeze(0)
+    
     with torch.no_grad():
         prob = anti_spoof_model(roi).numpy()[0]
-        real_score = prob[1]
-    return real_score < 0.5  # True → spoof / phone
+        real_score = prob[1]  # Probability of being real
+    
+    # Return (is_spoof, score)
+    is_spoof = real_score < ANTI_SPOOF_THRESHOLD
+    return is_spoof, real_score
 # ---------------------------------------------------------------
 
 mp_face_mesh = mp_solutions.face_mesh
@@ -255,19 +275,29 @@ def main():
         for (t,r,b,l),enc in zip(face_locs,face_encs):
             name,conf=match_face(enc,known_encs,known_names)
             motion_ok=np.mean(list(mot_w))>3.5; blink_ok=blinks>0
-            spoof=is_spoof_or_phone(frame_bgr,(l,t,r,b))
+            spoof, spoof_score = is_spoof_or_phone(frame_bgr,(l,t,r,b))
             live=bool(name and conf>=MIN_CONFIDENCE and (blink_ok or motion_ok) and not spoof)
             if live: verified_names.add(name)
 
             if spoof:
-                color=(0,0,255); label="Spoof/Phone Detected"
+                color=(0,0,255)
+                label=f"SPOOF! Score:{spoof_score:.2f}"
             elif name in verified_names:
-                color=(0,255,0); label=f"{name}"
+                color=(0,255,0)
+                label=f"{name} (Real:{spoof_score:.2f})"
             else:
-                color=(0,0,255); label=f"Unknown {conf:.2f}"
+                color=(0,0,255)
+                label=f"Unknown {conf:.2f}"
+            
             cv2.rectangle(frame_bgr,(l,t),(r,b),color,2)
             cv2.putText(frame_bgr,label,(l,t-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
-
+            
+            # Show liveness indicators
+            status_y = b + 20
+            if ENABLE_ANTI_SPOOF:
+                score_color = (0,255,0) if not spoof else (0,0,255)
+                cv2.putText(frame_bgr,f"AS:{spoof_score:.2f}",(l,status_y),cv2.FONT_HERSHEY_SIMPLEX,0.4,score_color,1)
+            
             if live and not spoof:
                 record,status=should_record(name)
                 if record:
@@ -275,10 +305,11 @@ def main():
                     print(f"[LOG] {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
                     blinks=0
             elif spoof:
-                print(f"[WARN] Spoof/Phone detected for {name or 'Unknown'} — skipping attendance")
+                print(f"[WARN] Spoof detected! Score:{spoof_score:.3f} (threshold:{ANTI_SPOOF_THRESHOLD}) - {name or 'Unknown'}")
 
         fps=frames/(time.time()-t0)
-        cv2.putText(frame_bgr,f"FPS:{fps:.1f}",(10,25),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+        info_text = f"FPS:{fps:.1f} | Blinks:{blinks} | Motion:{np.mean(list(mot_w)):.1f}"
+        cv2.putText(frame_bgr,info_text,(10,25),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),2)
         cv2.imshow("Crowd Attendance (IN/OUT)",imutils.resize(frame_bgr,width=FRAME_WIDTH))
         if cv2.waitKey(1)&0xFF==ord('q'): break
 
