@@ -1,65 +1,100 @@
-"# Camera Face Detection System
+"# Face Attendance System with Backend Sync
 
-Face detection diagnostic tool with continuous sync from backend API for Raspberry Pi 5 attendance system.
+Production-ready face recognition attendance system for Raspberry Pi 5 with automatic backend sync and webhook integration.
 
 ## System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Backend Server (VDM) - File Browser                        │
-│  http://vdm.csceducation.net/media/students                 │
-│  - Directory structure with student roll numbers            │
-│  - Example: rollnumber1/photo.png, rollnumber2/image.jpg    │
-│  - Updates when new students are added                      │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     │ HTTP(S) - Every 5 minutes
-                     │ (Recursive directory scan + sync)
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Raspberry Pi 5 - Attendance Device                         │
+│  Backend Server (VDM)                                       │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │  sync_faces.py (Background Service)                  │   │
-│  │  - Recursively scans file browser structure          │   │
-│  │  - Mirrors directory structure locally               │   │
-│  │  - Downloads new/updated images                      │   │
-│  │  - Removes deleted students/images                   │   │
-│  │  - Maintains local cache with same structure         │   │
+│  │  File Browser: /media/students                       │   │
+│  │  - rollnumber1/photo.png                             │   │
+│  │  - rollnumber2/image.jpg                             │   │
+│  │  (Updates when new students added)                   │   │
+│  └──────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Webhook API: /attendance/webhook/daily-attendance/  │   │
+│  │  - Receives attendance CSV data                      │   │
+│  │  - Stores in MongoDB                                 │   │
+│  └──────────────────────────────────────────────────────┘   │
+└────────────────────┬────────────────────┬───────────────────┘
+                     │                    │
+         Download faces (every 5 min)     │ Upload attendance (every 10 min)
+                     │                    │
+                     ▼                    │
+┌─────────────────────────────────────────────────────────────┐
+│  Raspberry Pi 5 - FastAPI Attendance Server                 │
+│  http://raspberrypi:8000                                    │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  attendance_server.py (Entry Point)                  │   │
+│  │  1. Sync faces at startup                            │   │
+│  │  2. Start face_attendance.py                         │   │
+│  │  3. Periodic sync (every 5 min)                      │   │
+│  │  4. Upload attendance CSV (every 10 min)             │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                     │                                        │
+│                     ▼                                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  sync_faces.py (Background Worker)                   │   │
+│  │  - Recursively scans file browser                    │   │
+│  │  - Mirrors directory structure (rollnumber/photo)    │   │
+│  │  - Smart incremental updates                         │   │
+│  │  - Cleanup deleted students                          │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                     │                                        │
 │                     ▼                                        │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  cached_faces/                                       │   │
-│  │  ├── rollnumber1/photo.png                           │   │
-│  │  ├── rollnumber2/image.jpg                           │   │
-│  │  ├── rollnumber3/photo.png                           │   │
+│  │  ├── 23040453/photo.png                              │   │
+│  │  ├── 23040454/image.jpg                              │   │
 │  │  └── .cache_metadata.json                            │   │
-│  │  (Mirrors remote directory structure exactly)        │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                     │                                        │
 │                     ▼                                        │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │  Attendance System (face_detection.py / main app)    │   │
-│  │  - Uses local cached images for face recognition     │   │
-│  │  - Each subdirectory = student/person name           │   │
-│  │  - Real-time processing (no network delay)           │   │
-│  │  - Marks attendance based on detected faces          │   │
+│  │  face_attendance.py (Recognition Engine)             │   │
+│  │  - PiCamera2 live video capture                      │   │
+│  │  - CNN face detection                                │   │
+│  │  - Anti-spoof (MiniFASNetV2)                         │   │
+│  │  - Liveness detection (blink/motion)                 │   │
+│  │  - IN/OUT tracking                                   │   │
+│  │  - Daily CSV logging                                 │   │
 │  └──────────────────────────────────────────────────────┘   │
+│                     │                                        │
+│                     ▼                                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  attendance_YYYY-MM-DD.csv                           │   │
+│  │  name,status,timestamp                               │   │
+│  │  23040453,IN,2025-11-09 09:30:00                     │   │
+│  │  23040453,OUT,2025-11-09 17:45:00                    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                     │                                        │
+│                     └────────────────────────────────────────┘
+│                                  Uploaded to backend (every 10 min)
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- ✅ Recursive file browser scanning (automatically discovers subdirectories)
-- ✅ Preserves directory structure (rollnumber/photo.png → cached_faces/rollnumber/photo.png)
-- ✅ Continuous sync from backend API (every 2-5 minutes, configurable)
-- ✅ Smart incremental updates (only downloads changed files)
-- ✅ Automatic cleanup (removes deleted students/directories)
-- ✅ Face detection using OpenCV and face_recognition library
-- ✅ Local cache for fast, offline face recognition
-- ✅ Works with HTTP and HTTPS (including self-signed certificates)
-- ✅ Systemd service for reliable background operation
-- ✅ Optimized for Raspberry Pi 5
+## Features
+
+- ✅ **FastAPI Server**: Central entry point with REST API
+- ✅ **Auto Sync**: Downloads faces at startup and every 5 minutes
+- ✅ **Auto Upload**: Sends attendance CSV to backend every 10 minutes
+- ✅ **Webhook Integration**: Compatible with VDM backend API
+- ✅ **Recursive Scanning**: Automatically discovers student directories
+- ✅ **Directory Mirroring**: Preserves rollnumber/photo.png structure
+- ✅ **Face Recognition**: CNN detection with face_recognition library
+- ✅ **Anti-Spoof**: MiniFASNetV2 model prevents photo/video attacks
+- ✅ **Liveness Detection**: MediaPipe blink and motion detection
+- ✅ **IN/OUT Tracking**: Alternates between entry and exit
+- ✅ **Daily CSV Logs**: Stores attendance locally before upload
+- ✅ **Smart Updates**: Only downloads changed files
+- ✅ **Auto Cleanup**: Removes deleted students automatically
+- ✅ **HTTP/HTTPS Support**: Works with self-signed certificates
+- ✅ **REST API**: Monitor status, trigger manual sync/upload
+- ✅ **Raspberry Pi Optimized**: Designed for Raspberry Pi 5
 
 ## Installation (Raspberry Pi 5)
 
@@ -69,90 +104,198 @@ Face detection diagnostic tool with continuous sync from backend API for Raspber
 sudo apt update
 sudo apt install -y python3-pip python3-opencv
 sudo apt install -y cmake build-essential
-sudo apt install -y libopenblas-dev liblapack-dev
-sudo apt install -y libatlas-base-dev gfortran
+sudo apt install -y libopenblas-dev liblapack-dev libatlas-base-dev gfortran
+sudo apt install -y libhdf5-dev libhdf5-serial-dev libharfbuzz0b libwebp7 libjasper1
+sudo apt install -y libqtgui4 libqtwebkit4 libqt4-test libilmbase-dev libopenexr-dev
 ```
 
 ### 2. Install Python Packages
 
 ```bash
-pip3 install opencv-python face_recognition numpy
+# Install all dependencies
+pip3 install -r requirements.txt
+
+# Or install manually
+pip3 install opencv-python face_recognition numpy imutils
+pip3 install torch torchvision mediapipe picamera2
+pip3 install fastapi uvicorn requests
 ```
 
 **Note:** On Raspberry Pi, `dlib` (required by face_recognition) may take 20-30 minutes to compile. Be patient!
 
-### 3. Configure Remote Source
+### 3. Download Anti-Spoof Model
 
-Edit `face_detection.py` and set your remote URL:
+Download the MiniFASNetV2 model (if not already present):
 
-```python
-KNOWN_FACES_SOURCE = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
+```bash
+wget https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/raw/master/resources/anti_spoof_models/2.7_80x80_MiniFASNetV2.pth
 ```
 
-Or keep it as a local directory:
+### 4. Configure Backend URLs
+
+Edit `attendance_server.py` and configure:
 
 ```python
-KNOWN_FACES_SOURCE = "known_faces"
+BACKEND_WEBHOOK_URL = "http://vdm.csceducation.net/attendance/webhook/daily-attendance/"
+WEBHOOK_ACCESS_KEY = "vdm_attendance_webhook_2025"
+```
+
+Edit `sync_faces.py` and configure:
+
+```python
+REMOTE_URL = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 ```
 
 ## Usage
 
-### 1. Initial Setup - Run First Sync
+### Option 1: FastAPI Server (Recommended - Production)
 
-Before starting the attendance system, sync images once:
+Start the complete system with one command:
+
+```bash
+python3 attendance_server.py
+```
+
+This will:
+1. ✅ Sync faces from backend at startup
+2. ✅ Start face_attendance.py for recognition
+3. ✅ Sync faces every 5 minutes in background
+4. ✅ Upload attendance CSV every 10 minutes to backend
+5. ✅ Provide REST API at http://raspberrypi:8000
+
+**Access API Documentation:**
+- http://raspberrypi:8000/docs (Swagger UI)
+- http://raspberrypi:8000 (Status)
+
+### Option 2: Manual Mode (Testing/Development)
+
+#### Step 1: Initial Sync
 
 ```bash
 python3 sync_faces.py
 ```
 
-This will download all face images to `cached_faces/remote_students/`.
-
-### 2. Start Background Sync Service (Recommended)
-
-Enable continuous sync as a background service:
+#### Step 2: Start Attendance System
 
 ```bash
-# Copy service file
-sudo cp face-sync.service /etc/systemd/system/
+python3 face_attendance.py
+```
 
-# Edit paths if needed (change /home/pi/camera to your actual path)
-sudo nano /etc/systemd/system/face-sync.service
+### Option 3: Systemd Service (Auto-start on Boot)
 
-# Enable and start service
+Create a systemd service for the FastAPI server:
+
+```bash
+# Create service file
+sudo nano /etc/systemd/system/attendance-server.service
+```
+
+Add this content:
+
+```ini
+[Unit]
+Description=Face Attendance Server with Backend Sync
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/camera
+ExecStart=/usr/bin/python3 /home/pi/camera/attendance_server.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/pi/camera/server.log
+StandardError=append:/home/pi/camera/server.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
 sudo systemctl daemon-reload
-sudo systemctl enable face-sync.service
-sudo systemctl start face-sync.service
+sudo systemctl enable attendance-server.service
+sudo systemctl start attendance-server.service
 
 # Check status
-sudo systemctl status face-sync.service
+sudo systemctl status attendance-server.service
 
 # View live logs
-tail -f sync.log
+tail -f server.log
 ```
 
-The service will:
+The server will:
 - Start automatically on boot
-- Sync every 5 minutes (configurable)
-- Restart automatically if it crashes
-- Log all operations to `sync.log`
+- Sync faces every 5 minutes
+- Upload attendance every 10 minutes
+- Restart automatically if crashes
+- Log all operations to `server.log`
 
-### 3. Run Face Detection
+## REST API Endpoints
 
-Now your attendance system can use the cached images:
+The FastAPI server provides these endpoints:
 
+### GET /
+Server status and uptime
 ```bash
-python3 face_detection.py
+curl http://raspberrypi:8000/
 ```
 
-This will:
-- Use locally cached images (fast, no network delay)
-- Show cache status (last sync time, number of images)
-- Check all faces for validity
-- Display detailed diagnostics
-
-### Manual Sync Options
-
+### GET /status
+Detailed system status
 ```bash
+curl http://raspberrypi:8000/status
+```
+
+### GET /attendance/today
+Get today's attendance records
+```bash
+curl http://raspberrypi:8000/attendance/today
+```
+
+### POST /sync/manual
+Manually trigger face sync
+```bash
+curl -X POST http://raspberrypi:8000/sync/manual
+```
+
+### POST /upload/manual
+Manually upload attendance to backend
+```bash
+curl -X POST http://raspberrypi:8000/upload/manual
+```
+
+### POST /attendance/restart
+Restart face attendance system
+```bash
+curl -X POST http://raspberrypi:8000/attendance/restart
+```
+
+## Configuration
+
+### Adjust Sync/Upload Intervals
+
+Edit `attendance_server.py`:
+
+```python
+SYNC_INTERVAL_MINUTES = 5    # Sync faces every 5 minutes
+UPLOAD_INTERVAL_MINUTES = 10  # Upload attendance every 10 minutes
+```
+
+### Change Backend URLs
+
+Edit `attendance_server.py`:
+
+```python
+BACKEND_WEBHOOK_URL = "http://vdm.csceducation.net/attendance/webhook/daily-attendance/"
+WEBHOOK_ACCESS_KEY = "vdm_attendance_webhook_2025"
+```
+
+Edit `sync_faces.py`:
+
+```python
+REMOTE_URL = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 # Single sync (one-time)
 python3 sync_faces.py
 

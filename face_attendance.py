@@ -23,7 +23,7 @@ import json
 
 # ---------- CONFIG ----------
 # Remote source - synced by sync_faces.py background service
-KNOWN_FACES_SOURCE = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
+KNOWN_FACES_SOURCE = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"  # Synced by background service
 
 FRAME_WIDTH, FRAME_HEIGHT = 640, 480
