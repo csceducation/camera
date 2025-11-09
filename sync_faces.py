@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-Standalone script to sync remote faces to local cache.
-Designed to be run via cron or systemd timer on Raspberry Pi.
+Continuous sync script for Raspberry Pi attendance system.
+Pulls face images from backend API and maintains local cache.
+
+Architecture:
+- Backend API: Provides student face images via HTTP endpoint
+- Raspberry Pi: Runs this script as a background service (every 2-5 minutes)
+- Attendance System: Uses locally cached images for real-time face recognition
 
 Usage:
+    # Single run:
     python sync_faces.py
+    
+    # Continuous mode (runs every 5 minutes):
+    python sync_faces.py --continuous
+    
+    # Custom interval (in seconds):
+    python sync_faces.py --continuous --interval 120
 
-Schedule with cron (twice daily at 6 AM and 6 PM):
-    0 6,18 * * * cd /path/to/camera && /usr/bin/python3 sync_faces.py >> sync.log 2>&1
+Setup as systemd service (recommended for Raspberry Pi):
+    See README.md for systemd configuration
 """
 
 import urllib.request
@@ -18,10 +30,14 @@ import shutil
 import os
 import json
 from datetime import datetime
+import time
+import argparse
+import hashlib
 
 # Configuration
 REMOTE_URL = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"
+DEFAULT_SYNC_INTERVAL = 300  # 5 minutes in seconds
 
 
 class _LinkParser(HTMLParser):
@@ -100,13 +116,9 @@ def sync_faces():
     cache_path = Path(CACHE_DIR)
     cache_path.mkdir(parents=True, exist_ok=True)
     remote_dir = cache_path / "remote_students"
-    
-    # Clear old cache
-    if remote_dir.exists():
-        shutil.rmtree(remote_dir)
     remote_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get image URLs
+    # Get image URLs from backend
     try:
         image_urls = get_image_urls_from_url(REMOTE_URL)
     except Exception as e:
@@ -117,50 +129,136 @@ def sync_faces():
         print(f"  ❌ No images found at remote source")
         return False
     
-    print(f"  Found {len(image_urls)} image(s) to download")
+    print(f"  Found {len(image_urls)} image(s) from backend")
     
-    # Download images
+    # Track existing files for cleanup
+    existing_files = {f.name: f for f in remote_dir.glob('*') if f.is_file() and f.name != '.cache_metadata.json'}
+    downloaded_files = set()
+    
+    # Download/update images
     downloaded = 0
+    updated = 0
+    skipped = 0
     failed = 0
+    
     for url in image_urls:
         try:
             filename = os.path.basename(urllib.parse.urlsplit(url).path)
             if not filename or not _is_image_url(filename):
-                filename = f'student_{downloaded}.jpg'
+                # Generate consistent filename from URL hash
+                url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+                filename = f'student_{url_hash}.jpg'
             
             target_path = remote_dir / filename
+            downloaded_files.add(filename)
             
-            req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                with open(target_path, 'wb') as f:
-                    shutil.copyfileobj(resp, f)
+            # Check if file exists and compare
+            should_download = True
+            if target_path.exists():
+                # Quick size check - could be enhanced with ETag/Last-Modified headers
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
+                    req.get_method = lambda: 'HEAD'
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        remote_size = int(resp.headers.get('Content-Length', 0))
+                        local_size = target_path.stat().st_size
+                        if remote_size > 0 and remote_size == local_size:
+                            should_download = False
+                            skipped += 1
+                except:
+                    pass  # If HEAD fails, just download
             
-            downloaded += 1
-            print(f"  ✓ {filename}")
+            if should_download:
+                # Download the image
+                req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    with open(target_path, 'wb') as f:
+                        shutil.copyfileobj(resp, f)
+                
+                if target_path in existing_files.values():
+                    updated += 1
+                    print(f"  ↻ Updated: {filename}")
+                else:
+                    downloaded += 1
+                    print(f"  ↓ Downloaded: {filename}")
         except Exception as e:
             failed += 1
             print(f"  ✗ Failed: {url} - {e}")
+    
+    # Remove files that no longer exist on backend
+    removed = 0
+    for filename, filepath in existing_files.items():
+        if filename not in downloaded_files and filename != '.cache_metadata.json':
+            try:
+                filepath.unlink()
+                removed += 1
+                print(f"  🗑 Removed: {filename}")
+            except Exception as e:
+                print(f"  ⚠️  Failed to remove {filename}: {e}")
     
     # Update metadata
     metadata = {
         'last_sync': datetime.now().isoformat(),
         'source_url': REMOTE_URL,
-        'images_downloaded': downloaded,
-        'images_failed': failed
+        'total_images': len(downloaded_files),
+        'downloaded': downloaded,
+        'updated': updated,
+        'skipped': skipped,
+        'removed': removed,
+        'failed': failed
     }
     
     metadata_file = cache_path / ".cache_metadata.json"
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"  ✅ Sync complete: {downloaded} downloaded, {failed} failed")
+    print(f"  ✅ Sync complete: {downloaded} new, {updated} updated, {skipped} unchanged, {removed} removed, {failed} failed")
     return True
 
 
+def continuous_sync(interval_seconds):
+    """Run sync continuously at specified interval."""
+    print(f"Starting continuous sync mode (interval: {interval_seconds}s)")
+    print(f"Press Ctrl+C to stop\n")
+    
+    while True:
+        try:
+            sync_faces()
+            print(f"\n  💤 Waiting {interval_seconds} seconds until next sync...\n")
+            time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            print("\n\n👋 Stopping continuous sync...")
+            break
+        except Exception as e:
+            print(f"\n  ⚠️  Sync error: {e}")
+            print(f"  Retrying in {interval_seconds} seconds...\n")
+            time.sleep(interval_seconds)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Sync face images from backend API to local cache for Raspberry Pi attendance system'
+    )
+    parser.add_argument(
+        '--continuous',
+        action='store_true',
+        help='Run continuously at specified interval'
+    )
+    parser.add_argument(
+        '--interval',
+        type=int,
+        default=DEFAULT_SYNC_INTERVAL,
+        help=f'Sync interval in seconds (default: {DEFAULT_SYNC_INTERVAL}s = 5 minutes)'
+    )
+    
+    args = parser.parse_args()
+    
     try:
-        success = sync_faces()
-        exit(0 if success else 1)
+        if args.continuous:
+            continuous_sync(args.interval)
+        else:
+            success = sync_faces()
+            exit(0 if success else 1)
     except Exception as e:
         print(f"  ❌ Sync failed with error: {e}")
         exit(1)

@@ -84,70 +84,42 @@ def main():
     print("FACE IMAGE DIAGNOSTIC TOOL")
     print("=" * 70)
     
-    # If the source is a URL, ALWAYS sync on every script start (no cache validation)
-    # then process cached files. If it's a local path, keep current behavior.
+    # If the source is a URL, use the locally cached files maintained by sync_faces.py
+    # The sync script should be running as a background service to keep cache updated.
+    # If it's a local path, process that directory directly.
     if str(KNOWN_FACES_SOURCE).lower().startswith(('http://', 'https://')):
         print(f"🔗 Remote known-faces source: {KNOWN_FACES_SOURCE}")
-        print(f"  � Syncing images from remote source...")
+        print(f"  ℹ️  Using cached files from: {CACHE_DIR}")
+        print(f"  ℹ️  Note: Ensure sync_faces.py is running to keep cache updated\n")
         
         cache_path = Path(CACHE_DIR)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        remote_dir = cache_path / "remote_students"
         
-        # Clear old cache
-        if remote_dir.exists():
-            shutil.rmtree(remote_dir)
-        remote_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Get and download images
-        try:
-            image_urls = get_image_urls_from_url(KNOWN_FACES_SOURCE)
-            if not image_urls:
-                print(f"❌ No images found at remote source")
-                return
-            
-            print(f"  ↳ Found {len(image_urls)} image(s) to download")
-            
-            downloaded = 0
-            for url in image_urls:
-                try:
-                    filename = os.path.basename(urllib.parse.urlsplit(url).path)
-                    if not filename or not _is_image_url(filename):
-                        filename = f'student_{downloaded}.jpg'
-                    
-                    target_path = remote_dir / filename
-                    
-                    req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        with open(target_path, 'wb') as f:
-                            shutil.copyfileobj(resp, f)
-                    
-                    downloaded += 1
-                    print(f"  ↓ Downloaded: {filename}")
-                except Exception as e:
-                    print(f"  ⚠️  Failed to download {url}: {e}")
-            
-            if downloaded == 0:
-                print(f"❌ No images were successfully downloaded")
-                return
-            
-            # Update metadata
-            metadata = {
-                'last_sync': datetime.now().isoformat(),
-                'source_url': KNOWN_FACES_SOURCE,
-                'images_downloaded': downloaded
-            }
-            metadata_file = cache_path / ".cache_metadata.json"
-            with open(metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            print(f"  ✅ Successfully synced {downloaded} image(s)")
-            
-        except Exception as e:
-            print(f"❌ Failed to sync remote images: {e}")
+        # Check if cache exists and has been synced
+        if not cache_path.exists():
+            print(f"❌ Cache directory not found: {CACHE_DIR}")
+            print(f"💡 Run 'python sync_faces.py' first to download images")
             return
         
-        # Now process the cached directory
+        metadata_file = cache_path / ".cache_metadata.json"
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                last_sync = datetime.fromisoformat(metadata.get('last_sync', ''))
+                time_since_sync = datetime.now() - last_sync
+                minutes_ago = int(time_since_sync.total_seconds() / 60)
+                
+                print(f"  📊 Cache status:")
+                print(f"     Last synced: {last_sync.strftime('%Y-%m-%d %H:%M:%S')} ({minutes_ago} minutes ago)")
+                print(f"     Images cached: {metadata.get('total_images', 'unknown')}")
+                
+                if minutes_ago > 10:
+                    print(f"  ⚠️  Cache is {minutes_ago} minutes old - consider checking sync service\n")
+                else:
+                    print(f"  ✅ Cache is fresh\n")
+            except Exception as e:
+                print(f"  ⚠️  Could not read cache metadata: {e}\n")
+        
         known_faces_path = cache_path
     else:
         known_faces_path = Path(KNOWN_FACES_SOURCE)
