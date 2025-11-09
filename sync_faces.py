@@ -56,19 +56,25 @@ class _LinkParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == 'a' and 'href' in attrs:
-            self._maybe_add(attrs['href'])
+            href = attrs['href']
+            # Skip parent directory links
+            if href == '..' or href.endswith('/..'):
+                return
+            # Convert relative URL to absolute
+            abs_url = urllib.parse.urljoin(self.base_url, href)
+            self.links.append(abs_url)
         elif tag == 'img' and 'src' in attrs:
-            self._maybe_add(attrs['src'])
-
-    def _maybe_add(self, url):
-        abs_url = urllib.parse.urljoin(self.base_url, url)
-        self.links.append(abs_url)
+            src = attrs['src']
+            abs_url = urllib.parse.urljoin(self.base_url, src)
+            self.links.append(abs_url)
 
 
 def _is_image_url(url):
     lower = url.lower()
+    # Remove query parameters before checking extension
+    path = urllib.parse.urlsplit(url).path.lower()
     for ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'):
-        if lower.endswith(ext):
+        if path.endswith(ext):
             return True
     return False
 
@@ -79,13 +85,15 @@ def _is_directory_url(url):
     # If it ends with /, it's a directory
     if path.endswith('/'):
         return True
-    # If no extension and not an image, likely a directory
-    if '.' not in os.path.basename(path) and not _is_image_url(url):
+    # If no file extension (no dot in the last part) and not an image, likely a directory
+    basename = os.path.basename(path)
+    if '.' not in basename and not _is_image_url(url):
         return True
+    # If path looks like a folder (no extension), it's a directory
     return False
 
 
-def get_all_images_recursive(base_url, visited=None):
+def get_all_images_recursive(base_url, visited=None, depth=0):
     """Recursively discover all image URLs from file browser, preserving directory structure.
     
     Returns a list of tuples: (absolute_url, relative_path)
@@ -98,11 +106,18 @@ def get_all_images_recursive(base_url, visited=None):
         return []
     visited.add(base_url)
     
+    # Prevent infinite recursion
+    if depth > 10:
+        return []
+    
     results = []
+    indent = "  " * depth
     
     try:
+        print(f"{indent}[Scan] {base_url}")
+        
         req = urllib.request.Request(base_url, headers={
-            'User-Agent': 'face-diagnostic/1.0'
+            'User-Agent': 'Mozilla/5.0'
         })
         
         with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
@@ -121,11 +136,9 @@ def get_all_images_recursive(base_url, visited=None):
             parser = _LinkParser(base_url)
             parser.feed(text)
             
+            print(f"{indent}   Found {len(parser.links)} links")
+            
             for link in parser.links:
-                # Skip parent directory links
-                if link.endswith('../') or '/..' in link:
-                    continue
-                
                 # Skip if already visited
                 if link in visited:
                     continue
@@ -133,16 +146,39 @@ def get_all_images_recursive(base_url, visited=None):
                 # If it's an image, add it
                 if _is_image_url(link):
                     # Calculate relative path from base URL
-                    rel_path = get_relative_path(base_url, link)
+                    rel_path = get_relative_path(REMOTE_URL, link)
                     results.append((link, rel_path))
+                    print(f"{indent}   [+] Image: {rel_path}")
                 
-                # If it's a directory, recurse into it
-                elif _is_directory_url(link) and link.startswith(base_url):
-                    sub_results = get_all_images_recursive(link, visited)
-                    results.extend(sub_results)
+                # If it's a directory, check if it's a valid roll number folder
+                elif _is_directory_url(link):
+                    # Only recurse if it's under our base path
+                    base_path = REMOTE_URL.split('?')[0]  # Remove query params for comparison
+                    if link.startswith(base_path):
+                        # Check if this is a roll number folder (skip passport and non-numeric)
+                        path_part = urllib.parse.urlsplit(link).path
+                        folder_name = os.path.basename(path_part.rstrip('/'))
+                        
+                        # Skip passport folder
+                        if folder_name.lower() == 'passport':
+                            print(f"{indent}   [-] Skipping: passport folder")
+                            continue
+                        
+                        # Only process numeric folders (roll numbers) or the root
+                        # Root folder has no specific folder name or is the base
+                        is_root = (link.rstrip('/').split('?')[0] == base_path.rstrip('/'))
+                        is_rollnumber = folder_name.isdigit()
+                        
+                        if is_root or is_rollnumber:
+                            if is_rollnumber:
+                                print(f"{indent}   [>] Entering roll number folder: {folder_name}")
+                            sub_results = get_all_images_recursive(link, visited, depth + 1)
+                            results.extend(sub_results)
+                        else:
+                            print(f"{indent}   [-] Skipping non-numeric folder: {folder_name}")
     
     except Exception as e:
-        print(f"  ⚠️  Error scanning {base_url}: {e}")
+        print(f"{indent}   [!] Error: {e}")
     
     return results
 
@@ -151,14 +187,15 @@ def get_relative_path(base_url, full_url):
     """Extract relative path from full URL compared to base URL.
     
     Example:
-        base: http://example.com/students/
-        full: http://example.com/students/12345/photo.png
+        base: http://example.com/media/students?key=xxx
+        full: http://example.com/media/students/12345/photo.png?key=xxx
         returns: 12345/photo.png
     """
+    # Remove query parameters for path comparison
     base_parts = urllib.parse.urlsplit(base_url)
     full_parts = urllib.parse.urlsplit(full_url)
     
-    # Get the path components
+    # Get the path components (without query)
     base_path = base_parts.path.rstrip('/')
     full_path = full_parts.path
     
@@ -167,7 +204,12 @@ def get_relative_path(base_url, full_url):
         rel_path = full_path[len(base_path):].lstrip('/')
         return rel_path
     
-    # Fallback: just use the filename
+    # Fallback: just use the last two path components (folder/file)
+    path_parts = full_path.strip('/').split('/')
+    if len(path_parts) >= 2:
+        return '/'.join(path_parts[-2:])
+    
+    # Ultimate fallback: just the filename
     return os.path.basename(full_path)
 
 
@@ -181,15 +223,15 @@ def sync_faces():
     cache_path.mkdir(parents=True, exist_ok=True)
     
     # Get all image URLs with their relative paths from backend (recursive file browser scan)
-    print(f"  🔍 Scanning file browser for images (recursive)...")
+    print(f"  [*] Scanning file browser for images (recursive)...")
     try:
         image_data = get_all_images_recursive(REMOTE_URL)
     except Exception as e:
-        print(f"  ❌ Failed to scan file browser: {e}")
+        print(f"  [X] Failed to scan file browser: {e}")
         return False
     
     if not image_data:
-        print(f"  ❌ No images found at remote source")
+        print(f"  [X] No images found at remote source")
         return False
     
     print(f"  Found {len(image_data)} image(s) from backend")
@@ -248,13 +290,13 @@ def sync_faces():
                 
                 if str(rel_path) in existing_files:
                     updated += 1
-                    print(f"  ↻ Updated: {rel_path}")
+                    print(f"  [^] Updated: {rel_path}")
                 else:
                     downloaded += 1
-                    print(f"  ↓ Downloaded: {rel_path}")
+                    print(f"  [+] Downloaded: {rel_path}")
         except Exception as e:
             failed += 1
-            print(f"  ✗ Failed: {url} - {e}")
+            print(f"  [!] Failed: {url} - {e}")
     
     # Remove files that no longer exist on backend
     removed = 0
@@ -263,18 +305,18 @@ def sync_faces():
             try:
                 filepath.unlink()
                 removed += 1
-                print(f"  🗑 Removed: {rel_path_str}")
+                print(f"  [-] Removed: {rel_path_str}")
                 
                 # Remove empty directories
                 parent = filepath.parent
                 try:
                     if parent != cache_path and not any(parent.iterdir()):
                         parent.rmdir()
-                        print(f"  🗑 Removed empty dir: {parent.relative_to(cache_path)}")
+                        print(f"  [-] Removed empty dir: {parent.relative_to(cache_path)}")
                 except:
                     pass
             except Exception as e:
-                print(f"  ⚠️  Failed to remove {rel_path_str}: {e}")
+                print(f"  [!] Failed to remove {rel_path_str}: {e}")
     
     # Update metadata
     metadata = {
@@ -292,7 +334,7 @@ def sync_faces():
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"  ✅ Sync complete: {downloaded} new, {updated} updated, {skipped} unchanged, {removed} removed, {failed} failed")
+    print(f"  [OK] Sync complete: {downloaded} new, {updated} updated, {skipped} unchanged, {removed} removed, {failed} failed")
     return True
 
 
@@ -304,13 +346,13 @@ def continuous_sync(interval_seconds):
     while True:
         try:
             sync_faces()
-            print(f"\n  💤 Waiting {interval_seconds} seconds until next sync...\n")
+            print(f"\n  [~] Waiting {interval_seconds} seconds until next sync...\n")
             time.sleep(interval_seconds)
         except KeyboardInterrupt:
-            print("\n\n👋 Stopping continuous sync...")
+            print("\n\n[*] Stopping continuous sync...")
             break
         except Exception as e:
-            print(f"\n  ⚠️  Sync error: {e}")
+            print(f"\n  [!] Sync error: {e}")
             print(f"  Retrying in {interval_seconds} seconds...\n")
             time.sleep(interval_seconds)
 
@@ -340,5 +382,5 @@ if __name__ == "__main__":
             success = sync_faces()
             exit(0 if success else 1)
     except Exception as e:
-        print(f"  ❌ Sync failed with error: {e}")
+        print(f"  [X] Sync failed with error: {e}")
         exit(1)

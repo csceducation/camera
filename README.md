@@ -6,36 +6,42 @@ Face detection diagnostic tool with continuous sync from backend API for Raspber
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Backend Server (VDM)                                       │
-│  https://vdm.csceducation.net/media/students                │
-│  - Provides student face images via API endpoint            │
+│  Backend Server (VDM) - File Browser                        │
+│  http://vdm.csceducation.net/media/students                 │
+│  - Directory structure with student roll numbers            │
+│  - Example: rollnumber1/photo.png, rollnumber2/image.jpg    │
 │  - Updates when new students are added                      │
 └────────────────────┬────────────────────────────────────────┘
                      │
                      │ HTTP(S) - Every 5 minutes
-                     │ (Continuous sync)
+                     │ (Recursive directory scan + sync)
                      ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Raspberry Pi 5 - Attendance Device                         │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  sync_faces.py (Background Service)                  │   │
-│  │  - Polls backend API every few minutes               │   │
+│  │  - Recursively scans file browser structure          │   │
+│  │  - Mirrors directory structure locally               │   │
 │  │  - Downloads new/updated images                      │   │
-│  │  - Removes deleted images                            │   │
-│  │  - Maintains local cache in cached_faces/            │   │
+│  │  - Removes deleted students/images                   │   │
+│  │  - Maintains local cache with same structure         │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                     │                                        │
 │                     ▼                                        │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │  cached_faces/remote_students/                       │   │
-│  │  - Local copy of all student face images             │   │
-│  │  - Always up-to-date (within sync interval)          │   │
+│  │  cached_faces/                                       │   │
+│  │  ├── rollnumber1/photo.png                           │   │
+│  │  ├── rollnumber2/image.jpg                           │   │
+│  │  ├── rollnumber3/photo.png                           │   │
+│  │  └── .cache_metadata.json                            │   │
+│  │  (Mirrors remote directory structure exactly)        │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                     │                                        │
 │                     ▼                                        │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  Attendance System (face_detection.py / main app)    │   │
 │  │  - Uses local cached images for face recognition     │   │
+│  │  - Each subdirectory = student/person name           │   │
 │  │  - Real-time processing (no network delay)           │   │
 │  │  - Marks attendance based on detected faces          │   │
 │  └──────────────────────────────────────────────────────┘   │
@@ -44,11 +50,14 @@ Face detection diagnostic tool with continuous sync from backend API for Raspber
 
 ## Features
 
+- ✅ Recursive file browser scanning (automatically discovers subdirectories)
+- ✅ Preserves directory structure (rollnumber/photo.png → cached_faces/rollnumber/photo.png)
 - ✅ Continuous sync from backend API (every 2-5 minutes, configurable)
 - ✅ Smart incremental updates (only downloads changed files)
-- ✅ Automatic cleanup (removes deleted students)
+- ✅ Automatic cleanup (removes deleted students/directories)
 - ✅ Face detection using OpenCV and face_recognition library
 - ✅ Local cache for fast, offline face recognition
+- ✅ Works with HTTP and HTTPS (including self-signed certificates)
 - ✅ Systemd service for reliable background operation
 - ✅ Optimized for Raspberry Pi 5
 
@@ -217,10 +226,17 @@ Add this line to sync every 5 minutes:
 In `sync_faces.py`:
 
 ```python
-REMOTE_URL = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
+REMOTE_URL = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"
 DEFAULT_SYNC_INTERVAL = 300  # 5 minutes in seconds
 ```
+
+**How it works with file browser:**
+- The script recursively scans the file browser at `REMOTE_URL`
+- Discovers all subdirectories (e.g., rollnumber1/, rollnumber2/)
+- Downloads images found in each directory
+- Preserves the exact directory structure locally
+- Example: `rollnumber1/photo.png` → `cached_faces/rollnumber1/photo.png`
 
 **Recommended intervals based on usage:**
 - **High frequency updates** (students added often): 120-180 seconds (2-3 minutes)
@@ -232,7 +248,7 @@ DEFAULT_SYNC_INTERVAL = 300  # 5 minutes in seconds
 In `face_detection.py`:
 
 ```python
-KNOWN_FACES_SOURCE = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
+KNOWN_FACES_SOURCE = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"
 ```
 
@@ -240,6 +256,21 @@ CACHE_DIR = "cached_faces"
 ```python
 KNOWN_FACES_SOURCE = "known_faces"  # Use local directory
 ```
+
+**Directory structure for face recognition:**
+- Each subdirectory in the cache represents a person/student
+- Directory name (e.g., "rollnumber1") is used as the person's identifier
+- Multiple images per person are supported (all images in that directory)
+- Example structure:
+  ```
+  cached_faces/
+  ├── 12345/
+  │   ├── photo.png
+  │   └── photo2.jpg
+  ├── 67890/
+  │   └── image.png
+  └── .cache_metadata.json
+  ```
 
 ## Directory Structure
 
@@ -249,8 +280,14 @@ camera/
 ├── sync_faces.py              # Background sync service
 ├── face-sync.service          # Systemd service configuration
 ├── README.md                  # This file
-├── cached_faces/              # Auto-generated cache directory
-│   ├── remote_students/       # Synced student face images
+├── cached_faces/              # Auto-generated cache directory (mirrors remote)
+│   ├── rollnumber1/           # Student directory (from remote)
+│   │   ├── photo.png
+│   │   └── photo2.jpg
+│   ├── rollnumber2/           # Another student
+│   │   └── image.png
+│   ├── 12345/                 # Yet another student
+│   │   └── face.jpg
 │   └── .cache_metadata.json   # Sync metadata (timestamps, counts)
 ├── known_faces/               # Optional local faces directory
 │   └── person_name/
@@ -267,17 +304,53 @@ camera/
    - Every 5 minutes (or configured interval):
 
 2. **Smart Sync Process:**
-   - Fetches image list from backend API
+   - Recursively scans file browser at backend URL
+   - Discovers all subdirectories (e.g., student roll numbers)
    - Compares with local cache
    - Downloads only new/updated images (checks file size)
-   - Removes images no longer on backend
+   - Removes images/directories no longer on backend
+   - **Preserves exact directory structure** (rollnumber/photo.png)
    - Updates `.cache_metadata.json`
 
 3. **Attendance System:**
    - Runs `face_detection.py` (or your main app)
-   - Reads from local `cached_faces/remote_students/`
+   - Reads from local `cached_faces/` with subdirectories
+   - Each subdirectory = one person/student
+   - Subdirectory name = student identifier (e.g., roll number)
    - No network delay - instant face recognition
    - Cache is always fresh (within sync interval)
+
+### Example Flow
+
+**Remote file browser structure:**
+```
+http://vdm.csceducation.net/media/students/
+├── 12345/
+│   └── photo.png
+├── 67890/
+│   └── image.jpg
+└── 54321/
+    ├── face1.png
+    └── face2.jpg
+```
+
+**Local cached structure (after sync):**
+```
+cached_faces/
+├── 12345/
+│   └── photo.png
+├── 67890/
+│   └── image.jpg
+├── 54321/
+│   ├── face1.png
+│   └── face2.jpg
+└── .cache_metadata.json
+```
+
+**Face detection processes:**
+- Student "12345" → checks photo.png
+- Student "67890" → checks image.jpg
+- Student "54321" → checks both face1.png and face2.jpg
 
 ### Benefits of This Architecture
 
@@ -286,7 +359,10 @@ camera/
 ✅ **Efficient:** Only downloads changes, not entire dataset  
 ✅ **Automatic:** Systemd ensures sync keeps running  
 ✅ **Fresh:** Regular updates ensure new students appear quickly  
-✅ **Clean:** Old students automatically removed from cache
+✅ **Clean:** Old students automatically removed from cache  
+✅ **Organized:** Directory structure mirrors remote (student roll numbers preserved)  
+✅ **Scalable:** Handles unlimited students/subdirectories  
+✅ **Flexible:** Works with any file browser structure
 
 ## Troubleshooting
 
@@ -361,13 +437,15 @@ The script uses CNN for accuracy. If too slow:
 ### Sync Service (every 5 minutes)
 ```
 [2025-11-09 10:00:15] Starting face sync...
-  Source: https://vdm.csceducation.net/media/students?key=accessvdmfile
+  Source: http://vdm.csceducation.net/media/students?key=accessvdmfile
   Cache: cached_faces
+  🔍 Scanning file browser for images (recursive)...
   Found 47 image(s) from backend
-  ↓ Downloaded: student_a1b2c3.jpg
-  ↓ Downloaded: student_d4e5f6.jpg
-  ↻ Updated: student_x7y8z9.jpg
-  🗑 Removed: old_student_123.jpg
+  ↓ Downloaded: 12345/photo.png
+  ↓ Downloaded: 67890/image.jpg
+  ↻ Updated: 54321/face1.png
+  🗑 Removed: oldstudent/photo.jpg
+  🗑 Removed empty dir: oldstudent
   ✅ Sync complete: 2 new, 1 updated, 43 unchanged, 1 removed, 0 failed
 
   💤 Waiting 300 seconds until next sync...
@@ -378,7 +456,7 @@ The script uses CNN for accuracy. If too slow:
 ======================================================================
 FACE IMAGE DIAGNOSTIC TOOL
 ======================================================================
-🔗 Remote known-faces source: https://vdm.csceducation.net/...
+🔗 Remote known-faces source: http://vdm.csceducation.net/...
   ℹ️  Using cached files from: cached_faces
   ℹ️  Note: Ensure sync_faces.py is running to keep cache updated
 
@@ -386,6 +464,28 @@ FACE IMAGE DIAGNOSTIC TOOL
      Last synced: 2025-11-09 10:00:15 (2 minutes ago)
      Images cached: 47
   ✅ Cache is fresh
+
+======================================================================
+👤 Person: 12345
+======================================================================
+  Found 1 image file(s)
+
+📄 Checking: cached_faces/12345/photo.png
+  📐 Image size: 640x480 pixels
+  🔍 Detecting faces with CNN model...
+  ✅ CNN model detected 1 face(s)
+  ✅ Generated 1 face encoding(s)
+
+======================================================================
+👤 Person: 67890
+======================================================================
+  Found 1 image file(s)
+
+📄 Checking: cached_faces/67890/image.jpg
+  📐 Image size: 800x600 pixels
+  🔍 Detecting faces with CNN model...
+  ✅ CNN model detected 1 face(s)
+  ✅ Generated 1 face encoding(s)
 ```
 
 ## License
