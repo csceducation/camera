@@ -228,22 +228,28 @@ def should_record(name):
     """
     now = datetime.now()
     
-    # First time seeing this person
+    # First time seeing this person TODAY
     if name not in last_attendance_time:
+        print(f"[DEBUG] {name} - First time detected, marking as IN")
         last_attendance_time[name] = now
         current_status[name] = "IN"
         return True, "IN"
     
     # Check cooldown period to prevent duplicate rapid detections
     time_since_last = now - last_attendance_time[name]
-    if time_since_last.total_seconds() < IN_OUT_GAP_SECONDS:
+    seconds_since = time_since_last.total_seconds()
+    
+    if seconds_since < IN_OUT_GAP_SECONDS:
         # Too soon - ignore to prevent duplicates
+        print(f"[DEBUG] {name} - Cooldown active: {seconds_since:.1f}s / {IN_OUT_GAP_SECONDS}s")
         return False, current_status.get(name, "IN")
     
     # Enough time has passed - toggle status
     # If last status was IN, mark as OUT (and vice versa)
-    last_status = current_status.get(name, "OUT")  # Default to OUT if somehow missing
+    last_status = current_status.get(name, "IN")  # Get current status
     new_status = "OUT" if last_status == "IN" else "IN"
+    
+    print(f"[DEBUG] {name} - Toggling from {last_status} to {new_status} (time since last: {seconds_since:.1f}s)")
     
     current_status[name] = new_status
     last_attendance_time[name] = now
@@ -306,21 +312,45 @@ def main():
             if live: verified_names.add(name)
 
             # Get current status for display
-            current_person_status = current_status.get(name, "IN (New)")
+            if name in last_attendance_time:
+                # Already recorded - show current status
+                current_person_status = current_status.get(name, "IN")
+                # Calculate what next status will be
+                next_status = "OUT" if current_person_status == "IN" else "IN"
+                status_display = f"Status: {current_person_status} → Next: {next_status}"
+            else:
+                # First time - will be marked IN
+                current_person_status = "IN (New)"
+                status_display = "Status: New → Will mark IN"
             
             if spoof:
                 color=(0,0,255)
                 label=f"SPOOF! Score:{spoof_score:.2f}"
             elif name in verified_names:
                 color=(0,255,0)
-                # Show name and current/next status
-                label=f"{name} - Next: {current_person_status}"
+                label=f"{name}"
             else:
                 color=(0,0,255)
                 label=f"Unknown {conf:.2f}"
             
             cv2.rectangle(frame_bgr,(l,t),(r,b),color,2)
             cv2.putText(frame_bgr,label,(l,t-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+            
+            # Show current status prominently below the face
+            if name and not spoof:
+                # Create status message
+                if name in last_attendance_time:
+                    status_text = f"{name} you're marked as {current_person_status}"
+                    status_color = (0,255,0) if current_person_status == "IN" else (0,165,255)  # Green for IN, Orange for OUT
+                else:
+                    status_text = f"{name} you're marked as IN"
+                    status_color = (0,255,0)  # Green for new/IN
+                
+                # Status background box for better visibility
+                text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                box_coords = ((l, b+5), (l + text_size[0] + 10, b + text_size[1] + 15))
+                cv2.rectangle(frame_bgr, box_coords[0], box_coords[1], status_color, -1)
+                cv2.putText(frame_bgr, status_text, (l+5, b+text_size[1]+10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
             
             # Show liveness indicators
             status_y = b + 20
@@ -332,16 +362,19 @@ def main():
                 record,status=should_record(name)
                 if record:
                     append_csv(name,status)
-                    print(f"[LOG] {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
-                    blinks=0
+                    print(f"[LOG] ✓ {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
+                    # Don't reset blinks here - let them accumulate naturally
                 else:
                     # Cooldown period
                     time_since = datetime.now() - last_attendance_time.get(name, datetime.now())
                     cooldown_left = IN_OUT_GAP_SECONDS - int(time_since.total_seconds())
-                    if cooldown_left > 0:
-                        print(f"[INFO] {name} - Cooldown: {cooldown_left}s remaining")
+                    if cooldown_left > 0 and cooldown_left == IN_OUT_GAP_SECONDS - 1:  # Only print once per second
+                        print(f"[INFO] {name} - Cooldown: {cooldown_left}s remaining, next: {current_person_status}")
             elif spoof:
                 print(f"[WARN] Spoof detected! Score:{spoof_score:.3f} (threshold:{ANTI_SPOOF_THRESHOLD}) - {name or 'Unknown'}")
+            elif name:
+                # Recognized but not live (waiting for blink/motion)
+                print(f"[INFO] {name} detected - waiting for liveness (blinks:{blinks}, motion:{motion_ok})")
 
         fps=frames/(time.time()-t0)
         info_text = f"FPS:{fps:.1f} | Blinks:{blinks} | Motion:{np.mean(list(mot_w)):.1f}"
