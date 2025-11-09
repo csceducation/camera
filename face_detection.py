@@ -20,7 +20,7 @@ import ssl
 
 # This can be a local directory name (e.g. "known_faces")
 # or a URL such as the provided VDM endpoint.
-KNOWN_FACES_SOURCE = "known_faces"
+KNOWN_FACES_SOURCE = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 
 # Cache directory for downloaded remote faces
 CACHE_DIR = "cached_faces"

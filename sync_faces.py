@@ -36,7 +36,7 @@ import hashlib
 import ssl
 
 # Configuration
-REMOTE_URL = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
+REMOTE_URL = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"
 DEFAULT_SYNC_INTERVAL = 300  # 5 minutes in seconds
 
@@ -73,98 +73,160 @@ def _is_image_url(url):
     return False
 
 
-def get_image_urls_from_url(base_url):
-    """Return a list of image URLs discovered at base_url (HTML or JSON)."""
-    req = urllib.request.Request(base_url, headers={
-        'User-Agent': 'face-diagnostic/1.0'
-    })
+def _is_directory_url(url):
+    """Check if URL likely points to a directory (ends with / or no extension)."""
+    path = urllib.parse.urlsplit(url).path
+    # If it ends with /, it's a directory
+    if path.endswith('/'):
+        return True
+    # If no extension and not an image, likely a directory
+    if '.' not in os.path.basename(path) and not _is_image_url(url):
+        return True
+    return False
+
+
+def get_all_images_recursive(base_url, visited=None):
+    """Recursively discover all image URLs from file browser, preserving directory structure.
     
-    # Use SSL context for HTTPS, works with HTTP too
-    with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
-        content_type = resp.headers.get('Content-Type', '')
-        data = resp.read()
-
-    text = None
+    Returns a list of tuples: (absolute_url, relative_path)
+    For example: ('http://example.com/students/12345/photo.png', '12345/photo.png')
+    """
+    if visited is None:
+        visited = set()
+    
+    if base_url in visited:
+        return []
+    visited.add(base_url)
+    
+    results = []
+    
     try:
-        text = data.decode('utf-8', errors='replace')
-    except Exception:
+        req = urllib.request.Request(base_url, headers={
+            'User-Agent': 'face-diagnostic/1.0'
+        })
+        
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            data = resp.read()
+        
+        # Try to decode as text
         text = None
+        try:
+            text = data.decode('utf-8', errors='replace')
+        except Exception:
+            return results
+        
+        # Parse HTML for links
+        if text:
+            parser = _LinkParser(base_url)
+            parser.feed(text)
+            
+            for link in parser.links:
+                # Skip parent directory links
+                if link.endswith('../') or '/..' in link:
+                    continue
+                
+                # Skip if already visited
+                if link in visited:
+                    continue
+                
+                # If it's an image, add it
+                if _is_image_url(link):
+                    # Calculate relative path from base URL
+                    rel_path = get_relative_path(base_url, link)
+                    results.append((link, rel_path))
+                
+                # If it's a directory, recurse into it
+                elif _is_directory_url(link) and link.startswith(base_url):
+                    sub_results = get_all_images_recursive(link, visited)
+                    results.extend(sub_results)
+    
+    except Exception as e:
+        print(f"  ⚠️  Error scanning {base_url}: {e}")
+    
+    return results
 
-    image_urls = []
 
-    # If the server returned JSON list of URLs
-    if 'application/json' in content_type:
-        arr = json.loads(data)
-        if isinstance(arr, list):
-            for item in arr:
-                if isinstance(item, str) and _is_image_url(item):
-                    image_urls.append(urllib.parse.urljoin(base_url, item))
-
-    # If HTML/text, parse links
-    if text is not None:
-        parser = _LinkParser(base_url)
-        parser.feed(text)
-        for link in parser.links:
-            if _is_image_url(link):
-                image_urls.append(link)
-
-    # As a fallback, if the base_url itself points to an image, use it
-    if _is_image_url(base_url):
-        image_urls.append(base_url)
-
-    # Deduplicate while preserving order
-    return list(dict.fromkeys(image_urls))
+def get_relative_path(base_url, full_url):
+    """Extract relative path from full URL compared to base URL.
+    
+    Example:
+        base: http://example.com/students/
+        full: http://example.com/students/12345/photo.png
+        returns: 12345/photo.png
+    """
+    base_parts = urllib.parse.urlsplit(base_url)
+    full_parts = urllib.parse.urlsplit(full_url)
+    
+    # Get the path components
+    base_path = base_parts.path.rstrip('/')
+    full_path = full_parts.path
+    
+    # Remove base path from full path
+    if full_path.startswith(base_path):
+        rel_path = full_path[len(base_path):].lstrip('/')
+        return rel_path
+    
+    # Fallback: just use the filename
+    return os.path.basename(full_path)
 
 
 def sync_faces():
-    """Download images from remote URL to local cache."""
+    """Download images from remote URL to local cache, preserving directory structure."""
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting face sync...")
     print(f"  Source: {REMOTE_URL}")
     print(f"  Cache: {CACHE_DIR}")
     
     cache_path = Path(CACHE_DIR)
     cache_path.mkdir(parents=True, exist_ok=True)
-    remote_dir = cache_path / "remote_students"
-    remote_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get image URLs from backend
+    # Get all image URLs with their relative paths from backend (recursive file browser scan)
+    print(f"  🔍 Scanning file browser for images (recursive)...")
     try:
-        image_urls = get_image_urls_from_url(REMOTE_URL)
+        image_data = get_all_images_recursive(REMOTE_URL)
     except Exception as e:
-        print(f"  ❌ Failed to get image URLs: {e}")
+        print(f"  ❌ Failed to scan file browser: {e}")
         return False
     
-    if not image_urls:
+    if not image_data:
         print(f"  ❌ No images found at remote source")
         return False
     
-    print(f"  Found {len(image_urls)} image(s) from backend")
+    print(f"  Found {len(image_data)} image(s) from backend")
     
     # Track existing files for cleanup
-    existing_files = {f.name: f for f in remote_dir.glob('*') if f.is_file() and f.name != '.cache_metadata.json'}
+    existing_files = {}
+    for root, dirs, files in os.walk(cache_path):
+        for f in files:
+            if f != '.cache_metadata.json':
+                full_path = Path(root) / f
+                rel_to_cache = full_path.relative_to(cache_path)
+                existing_files[str(rel_to_cache)] = full_path
+    
     downloaded_files = set()
     
-    # Download/update images
+    # Download/update images, preserving directory structure
     downloaded = 0
     updated = 0
     skipped = 0
     failed = 0
     
-    for url in image_urls:
+    for url, rel_path in image_data:
         try:
-            filename = os.path.basename(urllib.parse.urlsplit(url).path)
-            if not filename or not _is_image_url(filename):
-                # Generate consistent filename from URL hash
-                url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-                filename = f'student_{url_hash}.jpg'
+            # Create target path preserving directory structure
+            # rel_path is like "12345/photo.png" or "rollnumber/image.jpg"
+            target_path = cache_path / rel_path
+            target_dir = target_path.parent
             
-            target_path = remote_dir / filename
-            downloaded_files.add(filename)
+            # Create directory if it doesn't exist
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+            downloaded_files.add(str(rel_path))
             
             # Check if file exists and compare
             should_download = True
             if target_path.exists():
-                # Quick size check - could be enhanced with ETag/Last-Modified headers
+                # Quick size check
                 try:
                     req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
                     req.get_method = lambda: 'HEAD'
@@ -184,26 +246,35 @@ def sync_faces():
                     with open(target_path, 'wb') as f:
                         shutil.copyfileobj(resp, f)
                 
-                if target_path in existing_files.values():
+                if str(rel_path) in existing_files:
                     updated += 1
-                    print(f"  ↻ Updated: {filename}")
+                    print(f"  ↻ Updated: {rel_path}")
                 else:
                     downloaded += 1
-                    print(f"  ↓ Downloaded: {filename}")
+                    print(f"  ↓ Downloaded: {rel_path}")
         except Exception as e:
             failed += 1
             print(f"  ✗ Failed: {url} - {e}")
     
     # Remove files that no longer exist on backend
     removed = 0
-    for filename, filepath in existing_files.items():
-        if filename not in downloaded_files and filename != '.cache_metadata.json':
+    for rel_path_str, filepath in existing_files.items():
+        if rel_path_str not in downloaded_files:
             try:
                 filepath.unlink()
                 removed += 1
-                print(f"  🗑 Removed: {filename}")
+                print(f"  🗑 Removed: {rel_path_str}")
+                
+                # Remove empty directories
+                parent = filepath.parent
+                try:
+                    if parent != cache_path and not any(parent.iterdir()):
+                        parent.rmdir()
+                        print(f"  🗑 Removed empty dir: {parent.relative_to(cache_path)}")
+                except:
+                    pass
             except Exception as e:
-                print(f"  ⚠️  Failed to remove {filename}: {e}")
+                print(f"  ⚠️  Failed to remove {rel_path_str}: {e}")
     
     # Update metadata
     metadata = {
