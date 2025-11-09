@@ -32,7 +32,7 @@ BLINK_EAR_THRESH = 0.22
 BLINK_CONSEC_FRAMES = 2
 LIVENESS_WINDOW = 12
 MIN_CONFIDENCE = 0.5
-IN_OUT_GAP_SECONDS = 10  # Minimum seconds between same person's IN/OUT (prevents duplicate rapid detections)
+IN_OUT_GAP_SECONDS = 120  # Minimum seconds between same person's IN/OUT (prevents duplicate rapid detections)
 MODEL_PATH = "2.7_80x80_MiniFASNetV2.pth"
 
 # Anti-spoof configuration
@@ -127,7 +127,7 @@ mp_face_mesh = mp_solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=4, refine_landmarks=True,
                                   min_detection_confidence=0.5, min_tracking_confidence=0.5)
 LEFT_EYE, RIGHT_EYE = [33,159,133,145,153,154], [263,386,362,374,380,381]
-last_attendance_time, current_status, verified_names = {}, {}, set()
+last_attendance_time, current_status, verified_names, complete_for_day = {}, {}, set(), set()
 
 # ---------- CSV ----------
 def get_today_csv():
@@ -218,10 +218,15 @@ def match_face(enc, encs, names):
 def load_last_status_from_csv(csv_path):
     """Load the last recorded status for each person from CSV.
     
+    Only considers people who have either IN or OUT (not both).
+    If someone has both IN and OUT already, they are complete for the day - skip them.
+    
     Returns:
         dict: {name: last_status} mapping
     """
     last_status = {}
+    status_counts = {}  # Track how many IN and OUT each person has
+    
     if not os.path.exists(csv_path):
         return last_status
     
@@ -232,21 +237,50 @@ def load_last_status_from_csv(csv_path):
                 if len(row) >= 2:
                     name = row[0]
                     status = row[1]
+                    
+                    # Track status counts
+                    if name not in status_counts:
+                        status_counts[name] = {"IN": 0, "OUT": 0}
+                    
+                    if status == "IN":
+                        status_counts[name]["IN"] += 1
+                    elif status == "OUT":
+                        status_counts[name]["OUT"] += 1
+                    
                     # Keep updating - the last occurrence will be the final status
                     last_status[name] = status
         
-        print(f"[INFO] Loaded last status for {len(last_status)} people from CSV")
+        # Filter out people who have both IN and OUT (they are complete for the day)
+        filtered_status = {}
+        complete_people = set()  # Track people who are done for the day
+        
         for name, status in last_status.items():
+            counts = status_counts.get(name, {"IN": 0, "OUT": 0})
+            has_in = counts["IN"] > 0
+            has_out = counts["OUT"] > 0
+            
+            if has_in and has_out:
+                # Person has both IN and OUT - they are complete, skip them
+                complete_people.add(name)
+                print(f"[INFO] {name} has both IN and OUT - skipping (complete for day)")
+            else:
+                # Person has only IN or only OUT - keep their last status
+                filtered_status[name] = status
+        
+        print(f"[INFO] Loaded last status for {len(filtered_status)} people from CSV")
+        for name, status in filtered_status.items():
             print(f"  - {name}: {status}")
     except Exception as e:
         print(f"[WARN] Failed to load CSV status: {e}")
+        complete_people = set()
     
-    return last_status
+    return filtered_status, complete_people
 
 def should_record(name):
     """Determine if attendance should be recorded and what status (IN/OUT).
     
     Logic:
+    - If person already has both IN and OUT today: Skip (complete)
     - First time seeing person TODAY: Check CSV for last status
       - If last status was IN: Mark as OUT
       - If last status was OUT or not in CSV: Mark as IN
@@ -258,6 +292,11 @@ def should_record(name):
     """
     now = datetime.now()
     
+    # Check if person is already complete for the day (has both IN and OUT)
+    if name in complete_for_day:
+        print(f"[DEBUG] {name} - Already has both IN and OUT today, skipping")
+        return False, "COMPLETE"
+    
     # First time seeing this person in THIS SESSION
     if name not in last_attendance_time:
         # Check what their last status was in the CSV
@@ -267,6 +306,8 @@ def should_record(name):
             # They were marked IN last time, so mark them OUT now
             new_status = "OUT"
             print(f"[DEBUG] {name} - First detection (was IN in CSV), marking as OUT")
+            # After marking OUT, they are complete for the day
+            complete_for_day.add(name)
         else:
             # They were OUT or not in CSV, mark as IN
             new_status = "IN"
@@ -289,6 +330,12 @@ def should_record(name):
     # If last status was IN, mark as OUT (and vice versa)
     last_status = current_status.get(name, "IN")  # Get current status
     new_status = "OUT" if last_status == "IN" else "IN"
+    
+    # If this completes their IN/OUT pair, mark them as complete
+    if new_status == "OUT" and last_status == "IN":
+        complete_for_day.add(name)
+        print(f"[DEBUG] {name} - Now complete for the day (has both IN and OUT)")
+
     
     print(f"[DEBUG] {name} - Toggling from {last_status} to {new_status} (time since last: {seconds_since:.1f}s)")
     
@@ -316,9 +363,9 @@ def main():
         return
     
     # Load last status from today's CSV file
-    global current_status
+    global current_status, complete_for_day
     csv_path = f"attendance_{datetime.now():%Y-%m-%d}.csv"
-    current_status = load_last_status_from_csv(csv_path)
+    current_status, complete_for_day = load_last_status_from_csv(csv_path)
     print("="*70)
     
     picam=Picamera2()
