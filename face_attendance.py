@@ -281,8 +281,27 @@ def main():
     print("="*70)
     ear_w,mot_w=deque(maxlen=LIVENESS_WINDOW),deque(maxlen=LIVENESS_WINDOW)
     blink_frames=blinks=0; last_gray=None; t0=time.time(); frames=0
+    
+    # Status display variables
+    show_status_until = None  # Timestamp until which to show status
+    frozen_frame = None  # The frame to display during status show
+    frozen_name = None  # Name of person whose status is being shown
+    frozen_status = None  # Status (IN/OUT) being shown
 
     while True:
+        # Check if we're in status display mode
+        if show_status_until and time.time() < show_status_until:
+            # Display the frozen frame with status message
+            if frozen_frame is not None:
+                cv2.imshow("Crowd Attendance (IN/OUT)", imutils.resize(frozen_frame, width=FRAME_WIDTH))
+            if cv2.waitKey(1) & 0xFF == ord('q'): 
+                break
+            continue  # Skip face detection while showing status
+        else:
+            # Reset status display mode
+            show_status_until = None
+            frozen_frame = None
+        
         frame_rgb=picam.capture_array()
         frame_bgr=cv2.cvtColor(frame_rgb,cv2.COLOR_RGB2BGR)
         frames+=1
@@ -363,6 +382,32 @@ def main():
                 if record:
                     append_csv(name,status)
                     print(f"[LOG] ✓ {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
+                    
+                    # Prepare frozen frame with success message
+                    frozen_frame = frame_bgr.copy()
+                    frozen_name = name
+                    frozen_status = status
+                    
+                    # Draw success message on frozen frame
+                    msg = f"{name} you're marked as {status}"
+                    msg_color = (0,255,0) if status == "IN" else (0,165,255)
+                    
+                    # Large centered message
+                    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+                    text_x = (FRAME_WIDTH - text_size[0]) // 2
+                    text_y = FRAME_HEIGHT - 100
+                    
+                    # Background box
+                    box_coords = ((text_x - 20, text_y - text_size[1] - 20), (text_x + text_size[0] + 20, text_y + 20))
+                    cv2.rectangle(frozen_frame, box_coords[0], box_coords[1], msg_color, -1)
+                    cv2.putText(frozen_frame, msg, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,0), 3)
+                    
+                    # Add checkmark or icon
+                    cv2.putText(frozen_frame, "✓", (text_x - 60, text_y), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0,0,0), 4)
+                    
+                    # Set display duration (7 seconds)
+                    show_status_until = time.time() + 7
+                    
                     # Don't reset blinks here - let them accumulate naturally
                 else:
                     # Cooldown period
