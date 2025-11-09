@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+Crowd Attendance System — IN/OUT + MiniFASNetV2 Anti-Spoof (Raspberry Pi 5)
+----------------------------------------------------------------------------
+✅ Real-time PiCamera2 capture
+✅ Face recognition + blink + motion liveness
+✅ Deep MiniFASNet V2 anti-spoof model (2.7_80x80_MiniFASNetV2.pth)
+✅ Skips CSV for phones/photos
+✅ Daily CSV: attendance_YYYY-MM-DD.csv  (name, status, timestamp)
+✅ Alternates automatically (IN ↔ OUT)
+✅ Persistent green once verified
+✅ Uses synced cached faces from backend
+"""
+
+import os, time, csv, cv2, torch, torch.nn as nn, torch.nn.functional as F, numpy as np
+from datetime import datetime, timedelta
+from picamera2 import Picamera2
+from mediapipe import solutions as mp_solutions
+from collections import deque
+import face_recognition, imutils
+from pathlib import Path
+import json
+
+# ---------- CONFIG ----------
+# Remote source - synced by sync_faces.py background service
+KNOWN_FACES_SOURCE = "http://vdm.csceducation.net/media/students?key=accessvdmfile"
+CACHE_DIR = "cached_faces"  # Synced by background service
+
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+TOLERANCE = 0.45
+BLINK_EAR_THRESH = 0.22
+BLINK_CONSEC_FRAMES = 2
+LIVENESS_WINDOW = 12
+MIN_CONFIDENCE = 0.5
+IN_OUT_GAP_HOURS = 1
+MODEL_PATH = "2.7_80x80_MiniFASNetV2.pth"
+# ----------------------------
+
+# ---------- MiniFASNet V2 (official lightweight version) ----------
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.prelu = nn.PReLU(out_ch)
+    def forward(self, x): return self.prelu(self.bn(self.conv(x)))
+
+class DepthWise(nn.Module):
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.bn = nn.BatchNorm2d(in_ch)
+        self.prelu = nn.PReLU(in_ch)
+        self.project = nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=False)
+        self.bn_proj = nn.BatchNorm2d(out_ch)
+    def forward(self, x):
+        x = self.prelu(self.bn(self.conv(x)))
+        return self.bn_proj(self.project(x))
+
+class MiniFASNetV2(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.conv1 = ConvBlock(3, 64, 1)
+        self.conv2_dw = DepthWise(64, 64, 1)
+        self.conv_23 = DepthWise(64, 128, 2)
+        self.conv_34 = DepthWise(128, 128, 1)
+        self.conv_45 = DepthWise(128, 128, 1)
+        self.conv_56 = DepthWise(128, 256, 2)
+        self.conv_67 = DepthWise(256, 256, 1)
+        self.conv_78 = DepthWise(256, 512, 2)
+        self.conv_89 = DepthWise(512, 512, 1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.linear = nn.Linear(512, num_classes)
+        self.bn = nn.BatchNorm1d(num_classes)
+        self.softmax = nn.Softmax(dim=1)
+    def forward(self, x):
+        x = self.conv1(x); x = self.conv2_dw(x)
+        x = self.conv_23(x); x = self.conv_34(x); x = self.conv_45(x)
+        x = self.conv_56(x); x = self.conv_67(x)
+        x = self.conv_78(x); x = self.conv_89(x)
+        x = self.pool(x).view(x.size(0), -1)
+        x = self.linear(x); x = self.bn(x)
+        return self.softmax(x)
+
+device = "cpu"
+anti_spoof_model = MiniFASNetV2()
+anti_spoof_model.load_state_dict(torch.load(MODEL_PATH, map_location=device), strict=False)
+anti_spoof_model.eval()
+
+def is_spoof_or_phone(frame_bgr, bbox):
+    (l,t,r,b) = bbox
+    h,w = frame_bgr.shape[:2]
+    x1,y1 = max(l-20,0), max(t-20,0)
+    x2,y2 = min(r+20,w), min(b+20,h)
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0: return False
+    roi = cv2.resize(roi,(80,80))
+    roi = cv2.cvtColor(roi,cv2.COLOR_BGR2RGB).transpose(2,0,1)/255.0
+    roi = torch.tensor(roi,dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        prob = anti_spoof_model(roi).numpy()[0]
+        real_score = prob[1]
+    return real_score < 0.5  # True → spoof / phone
+# ---------------------------------------------------------------
+
+mp_face_mesh = mp_solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(max_num_faces=4, refine_landmarks=True,
+                                  min_detection_confidence=0.5, min_tracking_confidence=0.5)
+LEFT_EYE, RIGHT_EYE = [33,159,133,145,153,154], [263,386,362,374,380,381]
+last_attendance_time, current_status, verified_names = {}, {}, set()
+
+# ---------- CSV ----------
+def get_today_csv():
+    today = datetime.now().strftime("%Y-%m-%d")
+    fn = f"attendance_{today}.csv"
+    if not os.path.exists(fn):
+        with open(fn,"w",newline="") as f:
+            csv.writer(f).writerow(["name","status","timestamp"])
+    return fn
+def append_csv(name,status):
+    with open(get_today_csv(),"a",newline="") as f:
+        csv.writer(f).writerow([name,status,datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+
+# ---------- Helpers ----------
+def ear_ratio(lms, eye, w, h):
+    def p(i): lm=lms[i]; return np.array([lm.x*w,lm.y*h])
+    pts=[p(i) for i in eye]
+    A=np.linalg.norm(pts[1]-pts[4]); B=np.linalg.norm(pts[2]-pts[5]); C=np.linalg.norm(pts[0]-pts[3])
+    return (A+B)/(2.0*(C+1e-8))
+
+def load_known_faces():
+    """Load face encodings from cached_faces directory (synced by sync_faces.py)."""
+    encs, names = [], []
+    
+    # Determine which directory to use
+    if str(KNOWN_FACES_SOURCE).lower().startswith(('http://', 'https://')):
+        # Use cached directory synced by background service
+        known_dir = Path(CACHE_DIR)
+        
+        # Check cache status
+        if not known_dir.exists():
+            print(f"[ERROR] Cache directory not found: {CACHE_DIR}")
+            print(f"[INFO] Run 'python sync_faces.py' first to download images")
+            return encs, names
+        
+        metadata_file = known_dir / ".cache_metadata.json"
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                last_sync = datetime.fromisoformat(metadata.get('last_sync', ''))
+                time_since_sync = datetime.now() - last_sync
+                minutes_ago = int(time_since_sync.total_seconds() / 60)
+                
+                print(f"[INFO] Cache last synced: {last_sync.strftime('%Y-%m-%d %H:%M:%S')} ({minutes_ago} minutes ago)")
+                print(f"[INFO] Images cached: {metadata.get('total_images', 'unknown')}")
+                
+                if minutes_ago > 10:
+                    print(f"[WARN] Cache is {minutes_ago} minutes old - check sync service")
+            except Exception as e:
+                print(f"[WARN] Could not read cache metadata: {e}")
+    else:
+        # Use local directory
+        known_dir = Path(KNOWN_FACES_SOURCE)
+        if not known_dir.exists():
+            print(f"[ERROR] Directory not found: {KNOWN_FACES_SOURCE}")
+            return encs, names
+    
+    # Load encodings from directory structure (each subdirectory = person)
+    for person_dir in known_dir.iterdir():
+        if not person_dir.is_dir() or person_dir.name.startswith('.'):
+            continue
+        
+        person_name = person_dir.name  # Roll number or student ID
+        
+        for img_file in person_dir.iterdir():
+            if img_file.suffix.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+                continue
+            
+            try:
+                img = face_recognition.load_image_file(str(img_file))
+                encodings = face_recognition.face_encodings(img)
+                if encodings:
+                    encs.append(encodings[0])
+                    names.append(person_name)
+                    print(f"[INFO] Loaded: {person_name}/{img_file.name}")
+            except Exception as e:
+                print(f"[WARN] Failed to load {img_file}: {e}")
+    
+    print(f"[INFO] Loaded {len(encs)} face encodings from {len(set(names))} persons.")
+    return encs, names
+
+def match_face(enc, encs, names):
+    if not encs: return None,0.0
+    d=face_recognition.face_distance(encs,enc); i=np.argmin(d)
+    return (names[i],1-d[i]) if d[i]<=TOLERANCE else (None,1-d[i])
+
+def should_record(name):
+    now=datetime.now()
+    if name not in last_attendance_time:
+        last_attendance_time[name]=now; current_status[name]="IN"; return True,"IN"
+    if now-last_attendance_time[name]>timedelta(hours=IN_OUT_GAP_HOURS):
+        current_status[name]="OUT" if current_status[name]=="IN" else "IN"
+        last_attendance_time[name]=now; return True,current_status[name]
+    return False,current_status.get(name,"IN")
+
+# ---------- Main ----------
+def main():
+    print("="*70)
+    print("CROWD ATTENDANCE SYSTEM - IN/OUT Tracking")
+    print("="*70)
+    print(f"[INFO] Face source: {KNOWN_FACES_SOURCE}")
+    if str(KNOWN_FACES_SOURCE).lower().startswith(('http://', 'https://')):
+        print(f"[INFO] Using cached faces from: {CACHE_DIR}")
+        print(f"[INFO] Ensure sync_faces.py is running to keep cache updated")
+    print("="*70)
+    
+    known_encs,known_names=load_known_faces()
+    
+    if not known_encs:
+        print("[ERROR] No face encodings loaded! Cannot start attendance system.")
+        print("[INFO] If using remote source, run: python sync_faces.py")
+        return
+    
+    picam=Picamera2()
+    cfg=picam.create_preview_configuration(main={"size":(FRAME_WIDTH,FRAME_HEIGHT),"format":"RGB888"})
+    picam.configure(cfg); picam.start()
+    print("[INFO] Pi Camera started. Press 'q' to quit.")
+    print("="*70)
+    ear_w,mot_w=deque(maxlen=LIVENESS_WINDOW),deque(maxlen=LIVENESS_WINDOW)
+    blink_frames=blinks=0; last_gray=None; t0=time.time(); frames=0
+
+    while True:
+        frame_rgb=picam.capture_array()
+        frame_bgr=cv2.cvtColor(frame_rgb,cv2.COLOR_RGB2BGR)
+        frames+=1
+        face_locs=face_recognition.face_locations(frame_rgb,model="hog")
+        face_encs=face_recognition.face_encodings(frame_rgb,face_locs)
+
+        gray=cv2.cvtColor(frame_bgr,cv2.COLOR_BGR2GRAY)
+        motion=np.mean(cv2.absdiff(last_gray,gray)) if last_gray is not None else 0
+        mot_w.append(motion); last_gray=gray
+
+        res=face_mesh.process(frame_rgb)
+        if res.multi_face_landmarks:
+            lm=res.multi_face_landmarks[0].landmark
+            ear=(ear_ratio(lm,LEFT_EYE,FRAME_WIDTH,FRAME_HEIGHT)+
+                 ear_ratio(lm,RIGHT_EYE,FRAME_WIDTH,FRAME_HEIGHT))/2
+            ear_w.append(ear)
+            if ear<BLINK_EAR_THRESH: blink_frames+=1
+            else:
+                if blink_frames>=BLINK_CONSEC_FRAMES: blinks+=1
+                blink_frames=0
+
+        for (t,r,b,l),enc in zip(face_locs,face_encs):
+            name,conf=match_face(enc,known_encs,known_names)
+            motion_ok=np.mean(list(mot_w))>3.5; blink_ok=blinks>0
+            spoof=is_spoof_or_phone(frame_bgr,(l,t,r,b))
+            live=bool(name and conf>=MIN_CONFIDENCE and (blink_ok or motion_ok) and not spoof)
+            if live: verified_names.add(name)
+
+            if spoof:
+                color=(0,0,255); label="Spoof/Phone Detected"
+            elif name in verified_names:
+                color=(0,255,0); label=f"{name}"
+            else:
+                color=(0,0,255); label=f"Unknown {conf:.2f}"
+            cv2.rectangle(frame_bgr,(l,t),(r,b),color,2)
+            cv2.putText(frame_bgr,label,(l,t-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+            if live and not spoof:
+                record,status=should_record(name)
+                if record:
+                    append_csv(name,status)
+                    print(f"[LOG] {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
+                    blinks=0
+            elif spoof:
+                print(f"[WARN] Spoof/Phone detected for {name or 'Unknown'} — skipping attendance")
+
+        fps=frames/(time.time()-t0)
+        cv2.putText(frame_bgr,f"FPS:{fps:.1f}",(10,25),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+        cv2.imshow("Crowd Attendance (IN/OUT)",imutils.resize(frame_bgr,width=FRAME_WIDTH))
+        if cv2.waitKey(1)&0xFF==ord('q'): break
+
+    picam.stop(); cv2.destroyAllWindows(); print("[INFO] Session ended.")
+
+if __name__=="__main__": main()
