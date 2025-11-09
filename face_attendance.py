@@ -32,7 +32,7 @@ BLINK_EAR_THRESH = 0.22
 BLINK_CONSEC_FRAMES = 2
 LIVENESS_WINDOW = 12
 MIN_CONFIDENCE = 0.5
-IN_OUT_GAP_HOURS = 1
+IN_OUT_GAP_SECONDS = 10  # Minimum seconds between same person's IN/OUT (prevents duplicate rapid detections)
 MODEL_PATH = "2.7_80x80_MiniFASNetV2.pth"
 
 # Anti-spoof configuration
@@ -216,13 +216,39 @@ def match_face(enc, encs, names):
     return (names[i],1-d[i]) if d[i]<=TOLERANCE else (None,1-d[i])
 
 def should_record(name):
-    now=datetime.now()
+    """Determine if attendance should be recorded and what status (IN/OUT).
+    
+    Logic:
+    - First time seeing person: Mark as IN
+    - Subsequent times: Toggle between IN and OUT
+    - Cooldown period: Prevent duplicate rapid detections (10 seconds)
+    
+    Returns:
+        tuple: (should_record: bool, status: str)
+    """
+    now = datetime.now()
+    
+    # First time seeing this person
     if name not in last_attendance_time:
-        last_attendance_time[name]=now; current_status[name]="IN"; return True,"IN"
-    if now-last_attendance_time[name]>timedelta(hours=IN_OUT_GAP_HOURS):
-        current_status[name]="OUT" if current_status[name]=="IN" else "IN"
-        last_attendance_time[name]=now; return True,current_status[name]
-    return False,current_status.get(name,"IN")
+        last_attendance_time[name] = now
+        current_status[name] = "IN"
+        return True, "IN"
+    
+    # Check cooldown period to prevent duplicate rapid detections
+    time_since_last = now - last_attendance_time[name]
+    if time_since_last.total_seconds() < IN_OUT_GAP_SECONDS:
+        # Too soon - ignore to prevent duplicates
+        return False, current_status.get(name, "IN")
+    
+    # Enough time has passed - toggle status
+    # If last status was IN, mark as OUT (and vice versa)
+    last_status = current_status.get(name, "OUT")  # Default to OUT if somehow missing
+    new_status = "OUT" if last_status == "IN" else "IN"
+    
+    current_status[name] = new_status
+    last_attendance_time[name] = now
+    
+    return True, new_status
 
 # ---------- Main ----------
 def main():
@@ -279,12 +305,16 @@ def main():
             live=bool(name and conf>=MIN_CONFIDENCE and (blink_ok or motion_ok) and not spoof)
             if live: verified_names.add(name)
 
+            # Get current status for display
+            current_person_status = current_status.get(name, "IN (New)")
+            
             if spoof:
                 color=(0,0,255)
                 label=f"SPOOF! Score:{spoof_score:.2f}"
             elif name in verified_names:
                 color=(0,255,0)
-                label=f"{name} (Real:{spoof_score:.2f})"
+                # Show name and current/next status
+                label=f"{name} - Next: {current_person_status}"
             else:
                 color=(0,0,255)
                 label=f"Unknown {conf:.2f}"
@@ -304,6 +334,12 @@ def main():
                     append_csv(name,status)
                     print(f"[LOG] {name} marked {status} at {datetime.now():%Y-%m-%d %H:%M:%S}")
                     blinks=0
+                else:
+                    # Cooldown period
+                    time_since = datetime.now() - last_attendance_time.get(name, datetime.now())
+                    cooldown_left = IN_OUT_GAP_SECONDS - int(time_since.total_seconds())
+                    if cooldown_left > 0:
+                        print(f"[INFO] {name} - Cooldown: {cooldown_left}s remaining")
             elif spoof:
                 print(f"[WARN] Spoof detected! Score:{spoof_score:.3f} (threshold:{ANTI_SPOOF_THRESHOLD}) - {name or 'Unknown'}")
 
