@@ -16,6 +16,7 @@ import os
 import mimetypes
 import json
 from datetime import datetime, timedelta
+import ssl
 
 # This can be a local directory name (e.g. "known_faces")
 # or a URL such as the provided VDM endpoint.
@@ -25,6 +26,12 @@ KNOWN_FACES_SOURCE = "known_faces"
 CACHE_DIR = "cached_faces"
 # How often to refresh cache (in hours) - 12 hours = twice daily
 CACHE_REFRESH_HOURS = 12
+
+# Create SSL context that doesn't verify certificates (for self-signed certs or HTTP)
+# WARNING: This disables SSL verification - use only if you trust the source
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
 
 def check_image(image_path):
     """Check if an image contains a detectable face."""
@@ -261,7 +268,7 @@ def sync_remote_faces(source_url, cache_dir, refresh_hours):
             target_path = remote_dir / filename
             
             req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
                 with open(target_path, 'wb') as f:
                     shutil.copyfileobj(resp, f)
             
@@ -324,7 +331,7 @@ def get_image_urls_from_url(base_url):
     req = urllib.request.Request(base_url, headers={
         'User-Agent': 'face-diagnostic/1.0'
     })
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, context=ssl_context) as resp:
         content_type = resp.headers.get('Content-Type', '')
         data = resp.read()
 
@@ -366,7 +373,7 @@ def check_image_url(url):
     print(f"\n📄 Checking: {url}")
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=ssl_context) as resp:
             data = resp.read()
 
         arr = np.frombuffer(data, np.uint8)

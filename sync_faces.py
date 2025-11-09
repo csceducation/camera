@@ -33,11 +33,18 @@ from datetime import datetime
 import time
 import argparse
 import hashlib
+import ssl
 
 # Configuration
 REMOTE_URL = "https://vdm.csceducation.net/media/students?key=accessvdmfile"
 CACHE_DIR = "cached_faces"
 DEFAULT_SYNC_INTERVAL = 300  # 5 minutes in seconds
+
+# Create SSL context that doesn't verify certificates (for self-signed certs or HTTP)
+# WARNING: This disables SSL verification - use only if you trust the source
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
 
 
 class _LinkParser(HTMLParser):
@@ -71,7 +78,9 @@ def get_image_urls_from_url(base_url):
     req = urllib.request.Request(base_url, headers={
         'User-Agent': 'face-diagnostic/1.0'
     })
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    
+    # Use SSL context for HTTPS, works with HTTP too
+    with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
         content_type = resp.headers.get('Content-Type', '')
         data = resp.read()
 
@@ -159,7 +168,7 @@ def sync_faces():
                 try:
                     req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
                     req.get_method = lambda: 'HEAD'
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with urllib.request.urlopen(req, timeout=10, context=ssl_context) as resp:
                         remote_size = int(resp.headers.get('Content-Length', 0))
                         local_size = target_path.stat().st_size
                         if remote_size > 0 and remote_size == local_size:
@@ -171,7 +180,7 @@ def sync_faces():
             if should_download:
                 # Download the image
                 req = urllib.request.Request(url, headers={'User-Agent': 'face-diagnostic/1.0'})
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
                     with open(target_path, 'wb') as f:
                         shutil.copyfileobj(resp, f)
                 
