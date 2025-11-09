@@ -56,6 +56,11 @@ DEFAULT_SYNC_INTERVAL = 300  # 5 minutes
 REQUEST_TIMEOUT = 30
 MAX_RECURSION_DEPTH = 10
 
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2  # seconds
+RETRY_BACKOFF_MULTIPLIER = 2  # exponential backoff
+
 # SSL context for HTTPS with self-signed certificates
 # WARNING: Disables SSL verification - use only for trusted sources
 ssl_context = ssl.create_default_context()
@@ -149,25 +154,60 @@ def get_relative_path(base_url: str, full_url: str) -> str:
 
 
 def fetch_url_content(url: str) -> Optional[bytes]:
-    """Fetch URL content with error handling."""
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'face-sync/2.0'})
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context) as resp:
-            return resp.read()
-    except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
-        return None
+    """Fetch URL content with retry logic and exponential backoff."""
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'face-sync/2.0'})
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context) as resp:
+                return resp.read()
+        
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}: {e.reason}"
+            if e.code in (404, 403, 401):  # Don't retry client errors
+                logger.error(f"Failed to fetch {url}: {last_error}")
+                return None
+        
+        except urllib.error.URLError as e:
+            last_error = f"URL Error: {e.reason}"
+        
+        except Exception as e:
+            last_error = str(e)
+        
+        # Retry logic with exponential backoff
+        if attempt < MAX_RETRIES - 1:
+            delay = RETRY_DELAY_BASE * (RETRY_BACKOFF_MULTIPLIER ** attempt)
+            logger.warning(
+                f"Attempt {attempt + 1}/{MAX_RETRIES} failed for {url}: {last_error}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+        else:
+            logger.error(f"All {MAX_RETRIES} attempts failed for {url}: {last_error}")
+    
+    return None
 
 
 def get_remote_file_size(url: str) -> int:
-    """Get remote file size using HEAD request."""
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'face-sync/2.0'})
-        req.get_method = lambda: 'HEAD'
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context) as resp:
-            return int(resp.headers.get('Content-Length', 0))
-    except Exception:
-        return 0
+    """Get remote file size using HEAD request with retry logic."""
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'face-sync/2.0'})
+            req.get_method = lambda: 'HEAD'
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ssl_context) as resp:
+                return int(resp.headers.get('Content-Length', 0))
+        
+        except Exception as e:
+            last_error = str(e)
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY_BASE * (RETRY_BACKOFF_MULTIPLIER ** attempt)
+                time.sleep(delay)
+    
+    logger.debug(f"Failed to get file size for {url} after {MAX_RETRIES} attempts: {last_error}")
+    return 0
 
 
 def discover_images_recursive(
@@ -258,21 +298,39 @@ def discover_images_recursive(
 
 
 def download_file(url: str, target_path: Path) -> bool:
-    """Download file from URL to target path."""
-    try:
-        content = fetch_url_content(url)
-        if not content:
+    """Download file from URL to target path with retry logic."""
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            content = fetch_url_content(url)
+            if not content:
+                return False
+            
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(target_path, 'wb') as f:
+                f.write(content)
+            
+            return True
+        
+        except IOError as e:
+            last_error = f"IO Error: {e}"
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY_BASE * (RETRY_BACKOFF_MULTIPLIER ** attempt)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{MAX_RETRIES} failed to save {target_path}: {last_error}. "
+                    f"Retrying in {delay}s..."
+                )
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to save {target_path} after {MAX_RETRIES} attempts: {last_error}")
+        
+        except Exception as e:
+            logger.error(f"Unexpected error downloading {url}: {e}")
             return False
-        
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(target_path, 'wb') as f:
-            f.write(content)
-        
-        return True
-    except Exception as e:
-        logger.error(f"Failed to download {url}: {e}")
-        return False
+    
+    return False
 
 
 # ==================== Main Sync Logic ====================

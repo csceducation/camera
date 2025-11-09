@@ -21,6 +21,7 @@ import time
 import subprocess
 import threading
 import csv
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -47,10 +48,15 @@ WEBHOOK_ACCESS_KEY = "vdm_attendance_webhook_2025"
 SYNC_SCRIPT = "sync_faces.py"
 ATTENDANCE_SCRIPT = "face_attendance.py"
 SYNC_INTERVAL_MINUTES = 5
-UPLOAD_INTERVAL_MINUTES = 10
+UPLOAD_INTERVAL_MINUTES = 1
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
 SHUTDOWN_GRACE_PERIOD = 5  # seconds
 INITIAL_UPLOAD_DELAY = 120  # 2 minutes
+
+# Network retry configuration
+MAX_UPLOAD_RETRIES = 3
+UPLOAD_RETRY_DELAY_BASE = 5  # seconds
+UPLOAD_RETRY_BACKOFF = 2  # exponential multiplier
 
 # ==================== FastAPI App ====================
 app = FastAPI(
@@ -175,7 +181,7 @@ def read_csv_safely(csv_path: Path) -> List[Dict]:
 
 
 def upload_attendance_to_backend() -> None:
-    """Upload today's attendance CSV to backend webhook."""
+    """Upload today's attendance CSV to backend webhook with retry logic."""
     csv_file = get_today_csv_file()
     csv_path = Path(csv_file)
     
@@ -191,46 +197,84 @@ def upload_attendance_to_backend() -> None:
     
     logger.info(f"Uploading {len(rows)} attendance records from {csv_file}...")
     
-    try:
-        # Convert our CSV format (name, status, timestamp) to backend format
-        # (enrollment_number, status, timestamp)
-        csv_content = "enrollment_number,status,timestamp\n"
-        for row in rows:
-            csv_content += f"{row['name']},{row['status'].lower()},{row['timestamp']}\n"
-        
-        # Send to webhook
-        headers = {
-            "X-Webhook-Key": WEBHOOK_ACCESS_KEY,
-            "Content-Type": "text/csv"
-        }
-        
-        response = requests.post(
-            BACKEND_WEBHOOK_URL,
-            headers=headers,
-            data=csv_content.encode('utf-8'),
-            timeout=30
-        )
-        
-        response.raise_for_status()
-        result = response.json()
-        
-        # Log results
-        summary = result.get('summary', {})
-        logger.info(
-            f"Upload successful: {summary.get('successful', 0)} uploaded, "
-            f"{summary.get('failed', 0)} failed, {summary.get('duplicates', 0)} duplicates"
-        )
-        
-        # Log errors if any
-        if result.get('errors'):
-            logger.warning(f"Upload had {len(result['errors'])} errors")
-            for error in result['errors'][:3]:  # Show first 3
-                logger.warning(f"  Row {error['row']}: {error['error']}")
+    # Convert our CSV format (name, status, timestamp) to backend format
+    # (enrollment_number, status, timestamp)
+    csv_content = "enrollment_number,status,timestamp\n"
+    for row in rows:
+        csv_content += f"{row['name']},{row['status'].lower()},{row['timestamp']}\n"
     
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error during upload: {e}")
-    except Exception as e:
-        logger.error(f"Failed to upload attendance: {e}")
+    # Retry loop with exponential backoff
+    last_error = None
+    
+    for attempt in range(MAX_UPLOAD_RETRIES):
+        try:
+            # Send to webhook
+            headers = {
+                "X-Webhook-Key": WEBHOOK_ACCESS_KEY,
+                "Content-Type": "text/csv"
+            }
+            
+            response = requests.post(
+                BACKEND_WEBHOOK_URL,
+                headers=headers,
+                data=csv_content.encode('utf-8'),
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Log results
+            summary = result.get('summary', {})
+            logger.info(
+                f"Upload successful: {summary.get('successful', 0)} uploaded, "
+                f"{summary.get('failed', 0)} failed, {summary.get('duplicates', 0)} duplicates"
+            )
+            
+            # Log errors if any
+            if result.get('errors'):
+                logger.warning(f"Upload had {len(result['errors'])} errors")
+                for error in result['errors'][:3]:  # Show first 3
+                    logger.warning(f"  Row {error['row']}: {error['error']}")
+            
+            # Success - exit retry loop
+            return
+        
+        except requests.exceptions.HTTPError as e:
+            last_error = f"HTTP {e.response.status_code}: {e.response.text}"
+            
+            # Don't retry client errors (4xx)
+            if 400 <= e.response.status_code < 500:
+                logger.error(f"Upload failed with client error: {last_error}")
+                return
+        
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connection error: {e}"
+        
+        except requests.exceptions.Timeout as e:
+            last_error = f"Timeout: {e}"
+        
+        except requests.exceptions.RequestException as e:
+            last_error = f"Request error: {e}"
+        
+        except json.JSONDecodeError as e:
+            last_error = f"Invalid JSON response: {e}"
+        
+        except Exception as e:
+            last_error = f"Unexpected error: {e}"
+        
+        # Retry logic with exponential backoff
+        if attempt < MAX_UPLOAD_RETRIES - 1:
+            delay = UPLOAD_RETRY_DELAY_BASE * (UPLOAD_RETRY_BACKOFF ** attempt)
+            logger.warning(
+                f"Upload attempt {attempt + 1}/{MAX_UPLOAD_RETRIES} failed: {last_error}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+        else:
+            logger.error(
+                f"Upload failed after {MAX_UPLOAD_RETRIES} attempts: {last_error}"
+            )
 
 
 def periodic_sync() -> None:
