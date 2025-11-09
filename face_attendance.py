@@ -388,22 +388,36 @@ def main():
                     frozen_name = name
                     frozen_status = status
                     
+                    # Draw semi-transparent overlay for better visibility
+                    overlay = frozen_frame.copy()
+                    cv2.rectangle(overlay, (0, 0), (FRAME_WIDTH, FRAME_HEIGHT), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.5, frozen_frame, 0.5, 0, frozen_frame)
+                    
                     # Draw success message on frozen frame
                     msg = f"{name} you're marked as {status}"
                     msg_color = (0,255,0) if status == "IN" else (0,165,255)
                     
-                    # Large centered message
-                    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+                    # Calculate text size and position (centered)
+                    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
                     text_x = (FRAME_WIDTH - text_size[0]) // 2
-                    text_y = FRAME_HEIGHT - 100
+                    text_y = FRAME_HEIGHT // 2
                     
-                    # Background box
-                    box_coords = ((text_x - 20, text_y - text_size[1] - 20), (text_x + text_size[0] + 20, text_y + 20))
+                    # Background box with padding
+                    padding = 30
+                    box_coords = ((text_x - padding, text_y - text_size[1] - padding), 
+                                  (text_x + text_size[0] + padding, text_y + padding))
                     cv2.rectangle(frozen_frame, box_coords[0], box_coords[1], msg_color, -1)
-                    cv2.putText(frozen_frame, msg, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,0), 3)
                     
-                    # Add checkmark or icon
-                    cv2.putText(frozen_frame, "✓", (text_x - 60, text_y), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0,0,0), 4)
+                    # Draw border
+                    cv2.rectangle(frozen_frame, box_coords[0], box_coords[1], (255,255,255), 3)
+                    
+                    # Draw text
+                    cv2.putText(frozen_frame, msg, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 3)
+                    
+                    # Add checkmark above the message
+                    check_size = cv2.getTextSize("✓", cv2.FONT_HERSHEY_SIMPLEX, 3.0, 5)[0]
+                    check_x = (FRAME_WIDTH - check_size[0]) // 2
+                    cv2.putText(frozen_frame, "✓", (check_x, text_y - 80), cv2.FONT_HERSHEY_SIMPLEX, 3.0, (255,255,255), 5)
                     
                     # Set display duration (7 seconds)
                     show_status_until = time.time() + 7
