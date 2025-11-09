@@ -146,16 +146,51 @@ def start_attendance_system() -> bool:
     logger.info("Starting face attendance system...")
     logger.info("=" * 70)
     
+    # Check if script exists
+    if not Path(ATTENDANCE_SCRIPT).exists():
+        logger.error(f"Attendance script not found: {ATTENDANCE_SCRIPT}")
+        return False
+    
     try:
         process = subprocess.Popen(
             [sys.executable, ATTENDANCE_SCRIPT],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            bufsize=1  # Line buffered for real-time output
         )
         
         state.set_attendance_process(process)
         logger.info(f"Face attendance system started (PID: {process.pid})")
+        
+        # Give it a moment to start and check if it crashes immediately
+        time.sleep(2)
+        
+        if process.poll() is not None:
+            # Process already terminated
+            stdout, stderr = process.communicate(timeout=1)
+            logger.error("Attendance system terminated immediately after start!")
+            if stdout:
+                logger.error(f"STDOUT: {stdout}")
+            if stderr:
+                logger.error(f"STDERR: {stderr}")
+            return False
+        
+        logger.info("Attendance system is running")
+        
+        # Start a thread to monitor the process output
+        def log_output():
+            """Log subprocess output in real-time."""
+            try:
+                for line in process.stdout:
+                    if line.strip():
+                        logger.info(f"[ATTENDANCE] {line.strip()}")
+            except Exception as e:
+                logger.debug(f"Output monitoring stopped: {e}")
+        
+        output_thread = threading.Thread(target=log_output, daemon=True, name="AttendanceOutputMonitor")
+        output_thread.start()
+        
         return True
     except Exception as e:
         logger.error(f"Failed to start attendance system: {e}")
@@ -379,16 +414,25 @@ async def shutdown_event():
 async def root():
     """Server status and information."""
     uptime = datetime.now() - state.server_start_time
+    process = state.get_attendance_process()
+    
+    # Check if process is still running
+    is_running = state.is_attendance_running()
+    process_info = {
+        "running": is_running,
+        "pid": process.pid if process else None
+    }
+    
+    # If process died, try to get exit code
+    if process and not is_running:
+        process_info["exit_code"] = process.returncode
     
     return {
         "service": "Face Attendance System",
         "status": "running",
         "uptime": str(uptime).split('.')[0],
         "started_at": state.server_start_time.isoformat(),
-        "attendance_system": {
-            "running": state.is_attendance_running(),
-            "pid": state.attendance_process.pid if state.attendance_process else None
-        },
+        "attendance_system": process_info,
         "sync": {
             "interval_minutes": SYNC_INTERVAL_MINUTES,
             "csv_file": get_today_csv_file()
@@ -512,6 +556,59 @@ async def get_today_attendance():
         "records": records,
         "total": len(records)
     }
+
+
+@app.get("/attendance/health")
+async def attendance_health_check():
+    """Health check for attendance system with detailed diagnostics."""
+    process = state.get_attendance_process()
+    
+    if not process:
+        return {
+            "status": "not_started",
+            "message": "Attendance system has not been started",
+            "running": False
+        }
+    
+    is_running = process.poll() is None
+    
+    result = {
+        "status": "running" if is_running else "stopped",
+        "running": is_running,
+        "pid": process.pid
+    }
+    
+    if not is_running:
+        result["exit_code"] = process.returncode
+        result["message"] = f"Process terminated with exit code {process.returncode}"
+        
+        # Try to get error output
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+            if stderr:
+                result["stderr"] = stderr[-500:]  # Last 500 chars
+            if stdout:
+                result["stdout"] = stdout[-500:]
+        except:
+            pass
+    
+    return result
+
+
+@app.get("/logs/server")
+async def get_server_logs():
+    """Get last 50 lines of server log."""
+    log_file = Path("server.log")
+    
+    if not log_file.exists():
+        return {"lines": [], "message": "Log file not found"}
+    
+    try:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            return {"lines": lines[-50:], "total": len(lines)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== Main ====================
