@@ -215,12 +215,42 @@ def match_face(enc, encs, names):
     d=face_recognition.face_distance(encs,enc); i=np.argmin(d)
     return (names[i],1-d[i]) if d[i]<=TOLERANCE else (None,1-d[i])
 
+def load_last_status_from_csv(csv_path):
+    """Load the last recorded status for each person from CSV.
+    
+    Returns:
+        dict: {name: last_status} mapping
+    """
+    last_status = {}
+    if not os.path.exists(csv_path):
+        return last_status
+    
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 2:
+                    name = row[0]
+                    status = row[1]
+                    # Keep updating - the last occurrence will be the final status
+                    last_status[name] = status
+        
+        print(f"[INFO] Loaded last status for {len(last_status)} people from CSV")
+        for name, status in last_status.items():
+            print(f"  - {name}: {status}")
+    except Exception as e:
+        print(f"[WARN] Failed to load CSV status: {e}")
+    
+    return last_status
+
 def should_record(name):
     """Determine if attendance should be recorded and what status (IN/OUT).
     
     Logic:
-    - First time seeing person: Mark as IN
-    - Subsequent times: Toggle between IN and OUT
+    - First time seeing person TODAY: Check CSV for last status
+      - If last status was IN: Mark as OUT
+      - If last status was OUT or not in CSV: Mark as IN
+    - Subsequent times: Toggle between IN and OUT based on current_status
     - Cooldown period: Prevent duplicate rapid detections (10 seconds)
     
     Returns:
@@ -228,12 +258,23 @@ def should_record(name):
     """
     now = datetime.now()
     
-    # First time seeing this person TODAY
+    # First time seeing this person in THIS SESSION
     if name not in last_attendance_time:
-        print(f"[DEBUG] {name} - First time detected, marking as IN")
+        # Check what their last status was in the CSV
+        last_csv_status = current_status.get(name, None)
+        
+        if last_csv_status == "IN":
+            # They were marked IN last time, so mark them OUT now
+            new_status = "OUT"
+            print(f"[DEBUG] {name} - First detection (was IN in CSV), marking as OUT")
+        else:
+            # They were OUT or not in CSV, mark as IN
+            new_status = "IN"
+            print(f"[DEBUG] {name} - First detection (was {last_csv_status or 'NEW'} in CSV), marking as IN")
+        
         last_attendance_time[name] = now
-        current_status[name] = "IN"
-        return True, "IN"
+        current_status[name] = new_status
+        return True, new_status
     
     # Check cooldown period to prevent duplicate rapid detections
     time_since_last = now - last_attendance_time[name]
@@ -273,6 +314,12 @@ def main():
         print("[ERROR] No face encodings loaded! Cannot start attendance system.")
         print("[INFO] If using remote source, run: python sync_faces.py")
         return
+    
+    # Load last status from today's CSV file
+    global current_status
+    csv_path = f"attendance_{datetime.now():%Y-%m-%d}.csv"
+    current_status = load_last_status_from_csv(csv_path)
+    print("="*70)
     
     picam=Picamera2()
     cfg=picam.create_preview_configuration(main={"size":(FRAME_WIDTH,FRAME_HEIGHT),"format":"RGB888"})
